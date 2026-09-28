@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Colendar entry module"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Colendar main ability"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Colendar"
+    }
+  ]
+}
