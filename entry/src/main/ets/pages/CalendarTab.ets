@@ -21,6 +21,7 @@ import { common } from '@kit.AbilityKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { systemShare } from '@kit.ShareKit';
+import { i18n } from '@kit.LocalizationKit';
 import { TaskPackage, taskStore, TaskStep } from '../models/TaskPackage';
 import { ScheduledEvent, scheduleStore, getTotalDuration } from '../models/ScheduledEvent';
 import { ExecutionSession, executionStore } from '../models/ExecutionSession';
@@ -65,6 +66,13 @@ interface TimeResult {
   hour: number;
   /** 分钟 (0-59) */
   minute: number;
+}
+
+/** 公历日期对应的干支年、干支月和农历日文本。 */
+interface TraditionalDateInfo {
+  year: string;
+  month: string;
+  day: string;
 }
 
 /** 周视图中的一个显示单元：单个日程，或由两个重叠日程合成的卡片。 */
@@ -140,6 +148,12 @@ export struct CalendarTab {
   @State selectedDateStr: string = '';
   /** 选中日期的人类可读形式，如 "2026年6月30日" */
   @State selectedDateDisplay: string = '';
+  /** 固定标题使用显式响应式状态，避免真机在 @Builder 中忽略计算属性 Text 节点。 */
+  @State monthHeaderTitle: string = '';
+  @State monthHeaderTraditional: string = '';
+  @State weekHeaderTitle: string = '';
+  @State dayHeaderTitle: string = '';
+  @State dayHeaderTraditional: string = '';
   /**
    * 当前周视图的起始日期（周一），作为 Date 对象
    * 用于周视图的导航和日期范围显示
@@ -165,6 +179,8 @@ export struct CalendarTab {
    * 点击折叠态灰色条展开，点击展开态"←"按钮收起。
    */
   @State isLeftPanelExpanded: boolean = false;
+  /** 拖拽任务包经过“取消安排”区域时加深提示色。 */
+  @State private cancelScheduleDropActive: boolean = false;
 
   // ==================== 拖拽预览状态 ====================
 
@@ -216,6 +232,8 @@ export struct CalendarTab {
   private pinchAnchorMinutes: number = 0;
   /** 复制/剪切时保存的日程快照；粘贴前不修改原日程 */
   private pendingTransferEvent: ScheduledEvent | null = null;
+  /** 本次任务包拖拽结束后是否需要恢复展开左侧面板。 */
+  private reopenPanelAfterPackageDrag: boolean = false;
   /** 拉伸手势开始时的日程快照，确保 offset 始终基于同一基准计算 */
   private stretchOriginalEvent: ScheduledEvent | null = null;
 
@@ -280,21 +298,7 @@ export struct CalendarTab {
 
   /** 月视图标题 */
   get monthLabel(): string {
-    return `${this.currentYear}年 ${this.currentMonth + 1}月`;
-  }
-
-  /**
-   * 周视图标题：显示本周的日期范围
-   * 例如："6月22日 - 6月28日"
-   */
-  get weekLabel(): string {
-    const end: Date = new Date(this.currentWeekStart);
-    end.setDate(end.getDate() + 6); // 周日
-    const startStr: string =
-      `${this.currentWeekStart.getMonth() + 1}月${this.currentWeekStart.getDate()}日`;
-    const endStr: string =
-      `${end.getMonth() + 1}月${end.getDate()}日`;
-    return `${startStr} - ${endStr}`;
+    return `${this.currentYear}年${(this.currentMonth + 1).toString().padStart(2, '0')}月`;
   }
 
   /**
@@ -309,6 +313,132 @@ export struct CalendarTab {
     const days: number = Math.round((thursday.getTime() - jan1.getTime()) / 86400000);
     const weekNum: number = Math.floor(days / 7) + 1;
     return `${weekNum}周`;
+  }
+
+  /** 周视图固定标题，例如“2026年第40周”。 */
+  get weekTitleLabel(): string {
+    const thursday: Date = new Date(this.currentWeekStart);
+    thursday.setDate(thursday.getDate() + 3);
+    return `${thursday.getFullYear()}年第${this.weekNumberLabel}`;
+  }
+
+  /** 日视图固定标题，例如“2026年09月30日”。 */
+  get dayDateLabel(): string {
+    const parts: string[] = this.selectedDateStr.split('-');
+    if (parts.length !== 3) {
+      return this.selectedDateStr;
+    }
+    return `${parts[0]}年${parts[1]}月${parts[2]}日`;
+  }
+
+  /** 月视图所覆盖的干支年月；跨干支月时显示起止月份。 */
+  get monthGanZhiLabel(): string {
+    const firstDay: TraditionalDateInfo = this.getTraditionalDateInfo(
+      new Date(this.currentYear, this.currentMonth, 1)
+    );
+    const lastDay: TraditionalDateInfo = this.getTraditionalDateInfo(
+      new Date(this.currentYear, this.currentMonth + 1, 0)
+    );
+    if (firstDay.year === lastDay.year && firstDay.month === lastDay.month) {
+      return `${firstDay.year}年·${firstDay.month}月`;
+    }
+    if (firstDay.year === lastDay.year) {
+      return `${firstDay.year}年·${firstDay.month}月—${lastDay.month}月`;
+    }
+    return `${firstDay.year}年·${firstDay.month}月—${lastDay.year}年·${lastDay.month}月`;
+  }
+
+  /** 日视图当前日期对应的干支年月和农历日。 */
+  get dayTraditionalLabel(): string {
+    const parts: string[] = this.selectedDateStr.split('-');
+    if (parts.length !== 3) {
+      return '';
+    }
+    const traditionalDate: TraditionalDateInfo = this.getTraditionalDateInfo(
+      new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]))
+    );
+    return `${traditionalDate.year}年·${traditionalDate.month}月·${traditionalDate.day}`;
+  }
+
+  /** 使用系统中国农历确定年月日，再按传统规则推算干支年与干支月。 */
+  private getTraditionalDateInfo(date: Date): TraditionalDateInfo {
+    const lunarCalendar: i18n.Calendar = i18n.getCalendar('zh-Hans-CN', 'chinese');
+    lunarCalendar.setTime(date);
+    const heavenlyStems: string[] = ['甲', '乙', '丙', '丁', '戊', '己', '庚', '辛', '壬', '癸'];
+    const earthlyBranches: string[] = [
+      '子', '丑', '寅', '卯', '辰', '巳', '午', '未', '申', '酉', '戌', '亥'
+    ];
+    const dayNames: string[] = [
+      '初一', '初二', '初三', '初四', '初五', '初六', '初七', '初八', '初九', '初十',
+      '十一', '十二', '十三', '十四', '十五', '十六', '十七', '十八', '十九', '二十',
+      '廿一', '廿二', '廿三', '廿四', '廿五', '廿六', '廿七', '廿八', '廿九', '三十'
+    ];
+    const cyclicYearIndex: number = lunarCalendar.get('year') - 1;
+    const yearStemIndex: number = cyclicYearIndex % heavenlyStems.length;
+    const lunarMonthNumber: number = lunarCalendar.get('month') + 1;
+    // 甲己年丙作首：正月建寅，月干由年干与农历月份共同确定。
+    const monthStemIndex: number =
+      ((yearStemIndex % 5) * 2 + lunarMonthNumber + 1) % heavenlyStems.length;
+    const monthBranchIndex: number = (lunarMonthNumber + 1) % earthlyBranches.length;
+    const dayIndex: number = lunarCalendar.get('date') - 1;
+    const dayName: string = dayIndex >= 0 && dayIndex < dayNames.length ? dayNames[dayIndex] : '';
+    return {
+      year: heavenlyStems[yearStemIndex] +
+        earthlyBranches[cyclicYearIndex % earthlyBranches.length],
+      month: heavenlyStems[monthStemIndex] + earthlyBranches[monthBranchIndex],
+      day: dayName
+    };
+  }
+
+  /** 在日期导航状态变化后，生成可被 ArkUI 稳定追踪的固定标题文本。 */
+  private refreshCalendarHeaderTitles(): void {
+    this.monthHeaderTitle =
+      `${this.currentYear}年${(this.currentMonth + 1).toString().padStart(2, '0')}月`;
+
+    const thursday: Date = new Date(this.currentWeekStart);
+    thursday.setDate(thursday.getDate() + 3);
+    const jan1: Date = new Date(thursday.getFullYear(), 0, 1);
+    const days: number = Math.round((thursday.getTime() - jan1.getTime()) / 86400000);
+    const weekNum: number = Math.floor(days / 7) + 1;
+    this.weekHeaderTitle = `${thursday.getFullYear()}年第${weekNum}周`;
+
+    const parts: string[] = this.selectedDateStr.split('-');
+    if (parts.length === 3) {
+      this.dayHeaderTitle = `${parts[0]}年${parts[1]}月${parts[2]}日`;
+    } else {
+      this.dayHeaderTitle = this.selectedDateStr;
+    }
+
+    // 农历能力异常时只隐藏副标题，不能影响公历标题和页面启动。
+    try {
+      const firstDay: TraditionalDateInfo = this.getTraditionalDateInfo(
+        new Date(this.currentYear, this.currentMonth, 1)
+      );
+      const lastDay: TraditionalDateInfo = this.getTraditionalDateInfo(
+        new Date(this.currentYear, this.currentMonth + 1, 0)
+      );
+      if (firstDay.year === lastDay.year && firstDay.month === lastDay.month) {
+        this.monthHeaderTraditional = `${firstDay.year}年·${firstDay.month}月`;
+      } else if (firstDay.year === lastDay.year) {
+        this.monthHeaderTraditional = `${firstDay.year}年·${firstDay.month}月—${lastDay.month}月`;
+      } else {
+        this.monthHeaderTraditional =
+          `${firstDay.year}年·${firstDay.month}月—${lastDay.year}年·${lastDay.month}月`;
+      }
+
+      if (parts.length === 3) {
+        const traditionalDate: TraditionalDateInfo = this.getTraditionalDateInfo(
+          new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]))
+        );
+        this.dayHeaderTraditional =
+          `${traditionalDate.year}年·${traditionalDate.month}月·${traditionalDate.day}`;
+      } else {
+        this.dayHeaderTraditional = '';
+      }
+    } catch (_error) {
+      this.monthHeaderTraditional = '';
+      this.dayHeaderTraditional = '';
+    }
   }
 
   /** 日视图标题：显示完整日期和星期 */
@@ -335,6 +465,7 @@ export struct CalendarTab {
       today.getFullYear(), today.getMonth(), today.getDate()
     );
     this.selectedDateDisplay = this.dayLabel;
+    this.refreshCalendarHeaderTitles();
     this.loadData();
     this.buildCalendar();
     this.buildWeekData();
@@ -729,6 +860,7 @@ export struct CalendarTab {
         // 从缩小状态放大到正常大小
         this.dayViewScale = 1;
       }
+      this.refreshCalendarHeaderTitles();
     });
   }
 
@@ -745,6 +877,7 @@ export struct CalendarTab {
     }
     this.selectedDateStr = dateStr;
     this.selectedDateDisplay = this.formatDateDisplay(dateStr);
+    this.refreshCalendarHeaderTitles();
 
     // 先以缩小状态切换到日视图
     this.dayViewScale = 0.6;
@@ -769,6 +902,7 @@ export struct CalendarTab {
     // 同步 selectedDateStr 到上个月（取 1 号，确保在当月中）
     this.selectedDateStr = this.formatDateStr(this.currentYear, this.currentMonth, 1);
     this.selectedDateDisplay = this.formatDateDisplay(this.selectedDateStr);
+    this.refreshCalendarHeaderTitles();
     this.refreshEventsDateSet();
     this.buildCalendar();
   }
@@ -783,6 +917,7 @@ export struct CalendarTab {
     }
     this.selectedDateStr = this.formatDateStr(this.currentYear, this.currentMonth, 1);
     this.selectedDateDisplay = this.formatDateDisplay(this.selectedDateStr);
+    this.refreshCalendarHeaderTitles();
     this.refreshEventsDateSet();
     this.buildCalendar();
   }
@@ -797,6 +932,7 @@ export struct CalendarTab {
     );
     this.selectedDateDisplay = this.formatDateDisplay(this.selectedDateStr);
     this.currentWeekStart = CalendarTab.getMondayOf(today);
+    this.refreshCalendarHeaderTitles();
     this.refreshEventsDateSet();
     this.buildCalendar();
     this.buildWeekData();
@@ -814,6 +950,7 @@ export struct CalendarTab {
       newStart.getFullYear(), newStart.getMonth(), newStart.getDate()
     );
     this.selectedDateDisplay = this.formatDateDisplay(this.selectedDateStr);
+    this.refreshCalendarHeaderTitles();
     this.buildWeekData();
   }
 
@@ -826,6 +963,7 @@ export struct CalendarTab {
       newStart.getFullYear(), newStart.getMonth(), newStart.getDate()
     );
     this.selectedDateDisplay = this.formatDateDisplay(this.selectedDateStr);
+    this.refreshCalendarHeaderTitles();
     this.buildWeekData();
   }
 
@@ -843,6 +981,7 @@ export struct CalendarTab {
       d.getFullYear(), d.getMonth(), d.getDate()
     );
     this.selectedDateDisplay = this.formatDateDisplay(this.selectedDateStr);
+    this.refreshCalendarHeaderTitles();
   }
 
   /** 切换到后一天 */
@@ -857,6 +996,7 @@ export struct CalendarTab {
       d.getFullYear(), d.getMonth(), d.getDate()
     );
     this.selectedDateDisplay = this.formatDateDisplay(this.selectedDateStr);
+    this.refreshCalendarHeaderTitles();
   }
 
   // ==================== 日程标记 ====================
@@ -917,34 +1057,7 @@ export struct CalendarTab {
   private canPlaceScheduledInterval(
     dateStr: string, startMinutes: number, duration: number, excludedEventId: string = ''
   ): boolean {
-    const endMinutes: number = startMinutes + Math.max(1, duration);
-    const events: ScheduledEvent[] = this.getEventsForDate(dateStr).filter(
-      (evt: ScheduledEvent) => evt.id !== excludedEventId
-    );
-    const directlyOverlapping: ScheduledEvent[] = [];
-
-    for (const evt of events) {
-      if (this.intervalsOverlap(
-        startMinutes, endMinutes, this.eventStartMinutes(evt), this.eventEndMinutes(evt)
-      )) {
-        directlyOverlapping.push(evt);
-      }
-    }
-
-    if (directlyOverlapping.length === 0) {
-      return true;
-    }
-    if (directlyOverlapping.length >= 2) {
-      return false;
-    }
-
-    const partner: ScheduledEvent = directlyOverlapping[0];
-    for (const evt of events) {
-      if (evt.id !== partner.id && this.eventsOverlap(partner, evt)) {
-        return false;
-      }
-    }
-    return true;
+    return scheduleStore.canPlaceInterval(dateStr, startMinutes, duration, excludedEventId);
   }
 
   /** 周视图把互相重叠的两个日程整理成一个显示单元。 */
@@ -1043,6 +1156,7 @@ export struct CalendarTab {
    * 记录被拖拽任务包信息，初始化预览所需数据。
    */
   handleDragStart(pkg: TaskPackage): void {
+    this.reopenPanelAfterPackageDrag = this.isLeftPanelExpanded;
     this.activeDragPkgId = pkg.id;
     this.dropHighlightDate = '__dragging__';
     // 记录任务包总时长和名称，供预览和吸附计算使用
@@ -1052,6 +1166,36 @@ export struct CalendarTab {
     this.dragPreviewVisible = false;
     this.dragPreviewHasTime = false;
     this.dragPreviewDate = '';
+    if (this.isLeftPanelExpanded) {
+      animateTo({ duration: 220, curve: Curve.EaseInOut }, () => {
+        this.isLeftPanelExpanded = false;
+      });
+    }
+  }
+
+  /** 清理任务包拖拽状态，并在需要时恢复展开任务包面板。 */
+  private finishPackageDrag(): void {
+    const shouldReopen: boolean = this.reopenPanelAfterPackageDrag;
+    this.reopenPanelAfterPackageDrag = false;
+    this.activeDragPkgId = '';
+    this.dropHighlightDate = '';
+    this.dragPreviewVisible = false;
+    this.dragPreviewHasTime = false;
+    this.cancelScheduleDropActive = false;
+    if (shouldReopen && !this.isLeftPanelExpanded) {
+      animateTo({ duration: 220, curve: Curve.EaseInOut }, () => {
+        this.isLeftPanelExpanded = true;
+      });
+    }
+  }
+
+  /** 将任务包拖入左侧浅红区域时取消本次安排。 */
+  private cancelPackageDrag(): void {
+    if (!this.activeDragPkgId) {
+      return;
+    }
+    this.finishPackageDrag();
+    promptAction.showToast({ message: '已取消安排', duration: 1400 });
   }
 
   /**
@@ -1124,23 +1268,22 @@ export struct CalendarTab {
    * @param startMinute 开始分钟 (0/30)，可选
    */
   handleDrop(dateStr: string, pkgId: string, startHour?: number, startMinute?: number): void {
-    // 清除高亮与预览
-    this.dropHighlightDate = '';
-    this.dragPreviewVisible = false;
-
     if (!dateStr || !pkgId) {
+      this.finishPackageDrag();
       return;
     }
 
     // 查找任务包
     const pkg: TaskPackage | undefined = taskStore.getPackageById(pkgId);
     if (!pkg) {
+      this.finishPackageDrag();
       promptAction.showToast({ message: '任务包不存在', duration: 2000 });
       return;
     }
 
     // 防止同一任务包在同一天重复安排
     if (scheduleStore.isPackageScheduledOnDate(pkgId, dateStr)) {
+      this.finishPackageDrag();
       promptAction.showToast({
         message: `"${pkg.name}" 已安排在此日期`,
         duration: 2000
@@ -1168,6 +1311,7 @@ export struct CalendarTab {
     const totalMin: number = getTotalDuration(pkg.steps);
     const startTotalMin: number = sHour * 60 + sMin;
     if (!this.canPlaceScheduledInterval(dateStr, startTotalMin, totalMin)) {
+      this.finishPackageDrag();
       promptAction.showToast({
         message: '该时段已有两个任务包，不能继续安排',
         duration: 2000
@@ -1203,6 +1347,7 @@ export struct CalendarTab {
     // ---- 选中该日期并显示给用户 ----
     this.selectedDateStr = dateStr;
     this.selectedDateDisplay = this.formatDateDisplay(dateStr);
+    this.finishPackageDrag();
 
     const timeLabel: string = `${sHour.toString().padStart(2, '0')}:${sMin.toString().padStart(2, '0')}`;
     promptAction.showToast({
@@ -1724,7 +1869,33 @@ export struct CalendarTab {
   @Builder
   buildLeftPanel(): void {
     Column() {
-      if (this.isLeftPanelExpanded) {
+      if (this.activeDragPkgId !== '') {
+        // ==================== 拖拽态：取消安排目标 ====================
+        Column({ space: 8 }) {
+          Text('×')
+            .fontSize(24)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#D94848')
+          Text('取消\n安排')
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor('#B93636')
+            .textAlign(TextAlign.Center)
+        }
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Center)
+        .backgroundColor(this.cancelScheduleDropActive ? '#FFDADA' : '#FFF0F0')
+        .border({
+          width: this.cancelScheduleDropActive ? 2 : 1,
+          color: '#E36A6A',
+          style: BorderStyle.Dashed
+        })
+        .onDragEnter(() => { this.cancelScheduleDropActive = true; })
+        .onDragLeave(() => { this.cancelScheduleDropActive = false; })
+        .onDrop(() => { this.cancelPackageDrag(); })
+      } else if (this.isLeftPanelExpanded) {
         // ==================== 展开态：完整任务包面板 ====================
         // 点击面板空白区域即可收起（保留右上角 → 按钮的收起功能）
         Column() {
@@ -1811,6 +1982,11 @@ export struct CalendarTab {
                 .onDragStart((event: DragEvent) => {
                   this.handleDragStart(pkg);
                 })
+                .onDragEnd((_event: DragEvent) => {
+                  if (this.activeDragPkgId !== '') {
+                    this.finishPackageDrag();
+                  }
+                })
                 /**
                  * 点击卡片弹出详情弹窗（与 Tab1 行为一致）。
                  * 短按 = 弹窗，长按 = 拖拽，两者互不冲突。
@@ -1880,7 +2056,10 @@ export struct CalendarTab {
     }
     .width(this.isLeftPanelExpanded ? '30%' : '10%')
     .height('100%')
-    .backgroundColor(this.isLeftPanelExpanded ? '#F5F5F5' : '#E0E0E0')
+    .backgroundColor(
+      this.activeDragPkgId !== '' ? '#FFF0F0' :
+        this.isLeftPanelExpanded ? '#F5F5F5' : '#E0E0E0'
+    )
     .borderRadius(0)
   }
 
@@ -2273,12 +2452,7 @@ export struct CalendarTab {
           .enabled(!this.isCurrentMonthToday())
           .opacity(this.isCurrentMonthToday() ? 0.3 : 1.0)
 
-        // 月份标题
-        Text(this.monthLabel)
-          .fontSize(18)
-          .fontWeight(FontWeight.Bold)
-          .layoutWeight(1)
-          .textAlign(TextAlign.Center)
+        Blank().layoutWeight(1)
 
         // 视图切换按钮组
         this.buildViewSwitcher()
@@ -2295,6 +2469,27 @@ export struct CalendarTab {
       .width('100%')
       .padding({ top: 12, bottom: 8, left: 8, right: 8 })
       .backgroundColor('#FFFFFF')
+
+      // ---- 固定月份标题（不使用共享 Builder，规避真机增量渲染取值异常） ----
+      Row({ space: 6 }) {
+        Text(this.monthHeaderTitle)
+          .fontSize(16)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#1A1A1A')
+          .maxLines(1)
+        Text(this.monthHeaderTraditional)
+          .fontSize(11)
+          .fontWeight(FontWeight.Regular)
+          .fontColor('#777777')
+          .maxLines(1)
+      }
+      .width('100%')
+      .height(30)
+      .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+      .justifyContent(FlexAlign.Center)
+      .alignItems(VerticalAlign.Center)
+      .backgroundColor('#FFFFFF')
+      .border({ width: { bottom: 0.5 }, color: '#EEEEEE' })
 
       // ---- 星期标题行 ----
       Row() {
@@ -2429,18 +2624,19 @@ export struct CalendarTab {
             .height(52)
           },
           /**
-           * 键值生成器：使用 dateStr（如 "2026-06-15"）+ 索引做后备。
+           * 键值生成器：同时包含当前视图年月、格子索引和 dateStr。
            *
            * 为什么不用 index.toString()？
            * 当切换月份时，calendarCells 数组长度不变（始终 42），
            * 纯索引键 "0"~"41" 不会变化，ArkUI ForEach 认为键未变、
            * 数据未变，直接复用旧 GridItem，导致日历"卡住不动"。
            *
-           * 使用包含年月日的 dateStr 作为主键，每月每天都有唯一键，
-           * 切换月份时所有键都会变，强制 ForEach 正确重建每个格子。
+           * 相邻月份会共享同一个 dateStr（例如 10 月 1 日既可能是九月尾部灰格，
+           * 也可能是十月当月格），所以只用 dateStr 仍会复用错误样式。
+           * 把当前视图年月写入键后，切月时所有格子都会按新月份身份重建。
            */
           (_cell: CalendarCell, index: number) =>
-            _cell.dateStr || `${this.currentYear}-${this.currentMonth}-${index}`
+            `${this.currentYear}-${this.currentMonth}-${index}-${_cell.dateStr}`
         )
       }
       .columnsTemplate('1fr 1fr 1fr 1fr 1fr 1fr 1fr')
@@ -2480,12 +2676,7 @@ export struct CalendarTab {
           .enabled(!this.isCurrentWeekContainingToday())
           .opacity(this.isCurrentWeekContainingToday() ? 0.3 : 1.0)
 
-        // 周范围标题
-        Text(this.weekLabel)
-          .fontSize(18)
-          .fontWeight(FontWeight.Bold)
-          .layoutWeight(1)
-          .textAlign(TextAlign.Center)
+        Blank().layoutWeight(1)
 
         // 视图切换按钮组
         this.buildViewSwitcher()
@@ -2502,6 +2693,22 @@ export struct CalendarTab {
       .width('100%')
       .padding({ top: 12, bottom: 8, left: 8, right: 8 })
       .backgroundColor('#FFFFFF')
+
+      // ---- 固定周标题 ----
+      Row() {
+        Text(this.weekHeaderTitle)
+          .fontSize(16)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#1A1A1A')
+          .maxLines(1)
+      }
+      .width('100%')
+      .height(30)
+      .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+      .justifyContent(FlexAlign.Center)
+      .alignItems(VerticalAlign.Center)
+      .backgroundColor('#FFFFFF')
+      .border({ width: { bottom: 0.5 }, color: '#EEEEEE' })
 
       // ---- 日期标题行（首列为周数，后 7 列为周一~周日） ----
       Row() {
@@ -2846,14 +3053,7 @@ export struct CalendarTab {
           .enabled(!this.isSelectedDateToday())
           .opacity(this.isSelectedDateToday() ? 0.3 : 1.0)
 
-        // 日期标题（居中，显示完整日期 + 星期）
-        Text(this.dayLabel)
-          .fontSize(15)
-          .fontWeight(FontWeight.Bold)
-          .fontColor('#333333')
-          .layoutWeight(1)
-          .textAlign(TextAlign.Center)
-          .maxLines(1)
+        Blank().layoutWeight(1)
 
         // 视图切换按钮组
         this.buildViewSwitcher()
@@ -2871,15 +3071,24 @@ export struct CalendarTab {
       .padding({ top: 12, bottom: 8, left: 8, right: 8 })
       .backgroundColor('#FFFFFF')
 
-      // ---- 日期标题（固定在顶部，不随滚动而滚动） ----
-      Row() {
-        Text(this.dayLabel)
-          .fontSize(22)
+      // ---- 固定日期标题 ----
+      Row({ space: 6 }) {
+        Text(this.dayHeaderTitle)
+          .fontSize(16)
           .fontWeight(FontWeight.Bold)
           .fontColor('#1A1A1A')
-          .padding({ left: 12, top: 10, bottom: 10 })
+          .maxLines(1)
+        Text(this.dayHeaderTraditional)
+          .fontSize(11)
+          .fontWeight(FontWeight.Regular)
+          .fontColor('#777777')
+          .maxLines(1)
       }
       .width('100%')
+      .height(30)
+      .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+      .justifyContent(FlexAlign.Center)
+      .alignItems(VerticalAlign.Center)
       .backgroundColor('#FFFFFF')
       .border({ width: { bottom: 0.5 }, color: '#EEEEEE' })
 

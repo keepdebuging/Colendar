@@ -103,6 +103,41 @@ class ScheduleStore {
     );
   }
 
+  /** 校验候选时间段，保证同一重叠组最多同时存在两个日程。 */
+  public canPlaceInterval(
+    dateStr: string, startMinutes: number, duration: number, excludedEventId: string = ''
+  ): boolean {
+    const endMinutes: number = startMinutes + Math.max(1, duration);
+    const events: ScheduledEvent[] = this.events.filter(
+      (event: ScheduledEvent) => event.date === dateStr && event.id !== excludedEventId
+    );
+    const directlyOverlapping: ScheduledEvent[] = [];
+    for (const event of events) {
+      const eventStart: number = event.startHour * 60 + event.startMinute;
+      const eventEnd: number = eventStart + getTotalDuration(event.steps);
+      if (startMinutes < eventEnd && eventStart < endMinutes) {
+        directlyOverlapping.push(event);
+      }
+    }
+    if (directlyOverlapping.length === 0) {
+      return true;
+    }
+    if (directlyOverlapping.length >= 2) {
+      return false;
+    }
+    const partner: ScheduledEvent = directlyOverlapping[0];
+    const partnerStart: number = partner.startHour * 60 + partner.startMinute;
+    const partnerEnd: number = partnerStart + getTotalDuration(partner.steps);
+    return !events.some((event: ScheduledEvent) => {
+      if (event.id === partner.id) {
+        return false;
+      }
+      const eventStart: number = event.startHour * 60 + event.startMinute;
+      const eventEnd: number = eventStart + getTotalDuration(event.steps);
+      return partnerStart < eventEnd && eventStart < partnerEnd;
+    });
+  }
+
   /**
    * 删除指定 ID 的日程安排
    */
@@ -111,6 +146,7 @@ class ScheduleStore {
     this.events = this.events.filter((e: ScheduledEvent) => e.id !== eventId);
     if (this.events.length < initialLength) {
       this.persist();
+      this.notifyChange();
     }
   }
 
@@ -239,9 +275,8 @@ class ScheduleStore {
   /**
    * 通知所有订阅者数据已变化。
    *
-   * 仅在「级联变更」路径调用（syncPackageFields / removeEventsByPackageId）——
-   * 这些变更由 TaskStore 触发、发生在 CalendarTab 之外，UI 无法通过拖拽回调感知。
-   * addEvent / removeEvent 仍由调用方（CalendarTab）在操作后自行刷新，无需通知。
+   * 数据在 CalendarTab 外被更新或删除时主动通知 UI 刷新。
+   * addEvent 仍由拖拽调用方自行刷新，避免同一次安排重复重建。
    */
   private notifyChange(): void {
     for (const listener of this.listeners) {
