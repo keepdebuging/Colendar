@@ -87,6 +87,7 @@ struct Index {
       // 切换 Tab 时刷新数据
       this.refreshTrigger++;
     })
+    .id('main-tabs')
   }
 
   /**
@@ -114,5 +115,6 @@ struct Index {
     .height('100%')
     .justifyContent(FlexAlign.Center)
     .alignItems(HorizontalAlign.Center)
+    .id(tabIndex === 0 ? 'tab-packages' : 'tab-calendar')
   }
 }

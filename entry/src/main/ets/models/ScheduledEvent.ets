@@ -9,6 +9,7 @@
 import { TaskPackage, TaskStep } from './TaskPackage';
 import { generateId } from './TaskPackage';
 import { persistence } from './Persistence';
+import { TaskAction, copyTaskActions } from './TaskAction';
 
 /**
  * ScheduledEvent 接口 —— 一次日程安排
@@ -36,6 +37,10 @@ export interface ScheduledEvent {
   steps: TaskStep[];
   /** 是否启用应用内开始提醒；旧数据缺少该字段时按启用处理 */
   reminderEnabled?: boolean;
+  /** 当前日程实例是否已偏离母任务包；旧数据缺少该字段时按未定制处理 */
+  isCustomized?: boolean;
+  /** 从母任务包复制的动作快照 */
+  actions?: TaskAction[];
 }
 
 /**
@@ -91,6 +96,11 @@ class ScheduleStore {
    */
   public getEventsByDate(dateStr: string): ScheduledEvent[] {
     return this.events.filter((e: ScheduledEvent) => e.date === dateStr);
+  }
+
+  /** 按日程实例 ID 获取唯一事件。 */
+  public getEventById(eventId: string): ScheduledEvent | undefined {
+    return this.events.find((event: ScheduledEvent) => event.id === eventId);
   }
 
   /**
@@ -217,10 +227,11 @@ class ScheduleStore {
   public syncPackageFields(pkg: TaskPackage): void {
     let changed: boolean = false;
     for (const event of this.events) {
-      if (event.packageId === pkg.id) {
+      if (event.packageId === pkg.id && event.isCustomized !== true) {
         event.packageName = pkg.name;
         event.color = pkg.color;
         event.steps = pkg.steps;
+        event.actions = copyTaskActions(pkg.actions);
         // 基于新的步骤总时长重算结束时间
         const totalMin: number = getTotalDuration(pkg.steps);
         const endTotalMin: number = event.startHour * 60 + event.startMinute + totalMin;

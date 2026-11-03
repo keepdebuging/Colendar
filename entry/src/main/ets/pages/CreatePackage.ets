@@ -20,6 +20,7 @@
 import { router } from '@kit.ArkUI';
 import { TaskStep, TaskPackage, generateId, taskStore, getNextColor } from '../models/TaskPackage';
 import { promptAction } from '@kit.ArkUI';
+import { TaskAction, TaskActionTrigger, TaskActionType, copyTaskActions } from '../models/TaskAction';
 
 @Entry
 @Component
@@ -48,6 +49,7 @@ struct CreatePackage {
   @State steps: TaskStep[] = [
     { name: '', duration: 25 }
   ];
+  @State actions: TaskAction[] = [];
 
   // ==================== 生命周期 ====================
 
@@ -85,6 +87,7 @@ struct CreatePackage {
             // 原任务包没有步骤时，给一个空白步骤
             this.steps = [{ name: '', duration: 25 }];
           }
+          this.actions = copyTaskActions(pkg.actions);
         }
         // 如果 pkg 不存在（被并发删除），保持创建模式的默认值
         // 这样用户至少还能操作，不会直接崩溃
@@ -144,6 +147,60 @@ struct CreatePackage {
     this.steps = newSteps;
   }
 
+  private addAction(): void {
+    const action: TaskAction = {
+      id: generateId(),
+      trigger: 'session-start',
+      type: 'open-link',
+      target: '',
+      enabled: false
+    };
+    this.actions = [...this.actions, action];
+  }
+
+  private removeAction(index: number): void {
+    const next: TaskAction[] = copyTaskActions(this.actions);
+    next.splice(index, 1);
+    this.actions = next;
+  }
+
+  private updateActionTarget(index: number, target: string): void {
+    const next: TaskAction[] = copyTaskActions(this.actions);
+    next[index].target = target;
+    this.actions = next;
+  }
+
+  private toggleActionEnabled(index: number, enabled: boolean): void {
+    const next: TaskAction[] = copyTaskActions(this.actions);
+    next[index].enabled = enabled;
+    this.actions = next;
+  }
+
+  private cycleActionType(index: number): void {
+    const next: TaskAction[] = copyTaskActions(this.actions);
+    const current: TaskActionType = next[index].type;
+    next[index].type = current === 'open-link' ? 'open-app' :
+      (current === 'open-app' ? 'open-file' : 'open-link');
+    this.actions = next;
+  }
+
+  private cycleActionTrigger(index: number): void {
+    const next: TaskAction[] = copyTaskActions(this.actions);
+    const current: TaskActionTrigger = next[index].trigger;
+    next[index].trigger = current === 'session-start' ? 'step-start' : 'session-start';
+    this.actions = next;
+  }
+
+  private actionTypeLabel(type: TaskActionType): string {
+    if (type === 'open-app') {
+      return '打开应用';
+    }
+    if (type === 'open-file') {
+      return '打开文件';
+    }
+    return '打开链接';
+  }
+
   // ==================== 保存逻辑 ====================
 
   /**
@@ -180,6 +237,9 @@ struct CreatePackage {
     const validSteps: TaskStep[] = this.steps.filter(
       (step: TaskStep) => step.name.trim().length > 0
     );
+    const validActions: TaskAction[] = copyTaskActions(this.actions).filter(
+      (action: TaskAction) => action.target.trim().length > 0
+    );
 
     if (validSteps.length === 0) {
       promptAction.showToast({
@@ -197,6 +257,7 @@ struct CreatePackage {
         name: this.packageName.trim(),
         steps: validSteps,
         color: this.originalColor,
+        actions: validActions,
         _version: 0  // 由 updatePackage 内部自增覆盖
       };
 
@@ -222,6 +283,7 @@ struct CreatePackage {
         name: this.packageName.trim(),
         steps: validSteps,
         color: getNextColor(taskStore.packages.length),
+        actions: validActions,
         _version: 0
       };
 
@@ -387,6 +449,65 @@ struct CreatePackage {
             .onClick(() => {
               this.addStep();
             })
+
+          Divider().margin({ top: 20, left: 16, right: 16 })
+
+          Row() {
+            Text('关联动作（可选）')
+              .fontSize(16)
+              .fontWeight(FontWeight.Medium)
+            Blank()
+            Text('仅在用户开始任务后触发')
+              .fontSize(11)
+              .fontColor('#888888')
+          }
+          .width('100%')
+          .padding({ left: 20, right: 20, top: 16, bottom: 8 })
+
+          ForEach(this.actions, (action: TaskAction, index: number) => {
+            Column({ space: 8 }) {
+              Row({ space: 8 }) {
+                Button(this.actionTypeLabel(action.type))
+                  .fontSize(12)
+                  .onClick(() => { this.cycleActionType(index); })
+                Button(action.trigger === 'session-start' ? '任务开始时' : '步骤开始时')
+                  .fontSize(12)
+                  .onClick(() => { this.cycleActionTrigger(index); })
+                Blank()
+                Toggle({ type: ToggleType.Switch, isOn: action.enabled })
+                  .onChange((isOn: boolean) => { this.toggleActionEnabled(index, isOn); })
+                Button('✕')
+                  .fontSize(12)
+                  .width(32)
+                  .height(32)
+                  .backgroundColor('#FFE0E0')
+                  .fontColor('#FF4444')
+                  .onClick(() => { this.removeAction(index); })
+              }
+              TextInput({
+                text: action.target,
+                placeholder: action.type === 'open-app' ? '应用 bundleName' :
+                  (action.type === 'open-file' ? '已授权文件 URI' : 'https://...')
+              })
+                .onChange((value: string) => { this.updateActionTarget(index, value); })
+                .width('100%')
+            }
+            .width('calc(100% - 32px)')
+            .padding(10)
+            .margin({ left: 16, right: 16, bottom: 8 })
+            .backgroundColor('#FFFFFF')
+            .borderRadius(8)
+          }, (action: TaskAction) => action.id)
+
+          Button('＋ 添加关联动作')
+            .fontSize(15)
+            .fontColor('#007AFF')
+            .backgroundColor('#EBF5FF')
+            .width('calc(100% - 32px)')
+            .padding(10)
+            .borderRadius(8)
+            .margin({ left: 16, right: 16, top: 4 })
+            .onClick(() => { this.addAction(); })
 
           // 底部留白
           Blank()

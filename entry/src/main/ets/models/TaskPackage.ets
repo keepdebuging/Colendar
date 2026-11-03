@@ -10,6 +10,7 @@
 
 import { persistence } from './Persistence';
 import { scheduleStore } from './ScheduledEvent';
+import { TaskAction } from './TaskAction';
 
 // ==================== 预设颜色数组 ====================
 /**
@@ -58,6 +59,8 @@ export interface TaskPackage {
   steps: TaskStep[];
   /** (Week 2 新增) 主题色，用于卡片背景和日历标记 */
   color: string;
+  /** 用户明确配置的低风险启动动作 */
+  actions?: TaskAction[];
   /**
    * 内部版本号：每次 updatePackage 自增。
    * 不暴露给 UI 表单，仅用于 ForEach key 强制刷新——

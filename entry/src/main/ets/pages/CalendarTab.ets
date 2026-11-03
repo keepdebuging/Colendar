@@ -29,6 +29,13 @@ import { generateId } from '../models/TaskPackage';
 import { PackageDetailDialog } from './PackageDetailDialog';
 import { ScheduledEventDetailDialog } from './ScheduledEventDetailDialog';
 import { UpcomingTaskDialog } from './UpcomingTaskDialog';
+import { copyTaskActions } from '../models/TaskAction';
+import {
+  durationMinutesToHeight,
+  resolveTimelinePlacement,
+  TimelinePlacement,
+  timelineMinutesToY
+} from '../utils/TimelineGeometry';
 
 // ==================== 接口定义 ====================
 
@@ -202,6 +209,8 @@ export struct CalendarTab {
   @State dragPreviewColor: string = '#007AFF';
   /** 预览是否包含已吸附的时间（true=显示时间范围，false=仅显示日期+名称） */
   @State dragPreviewHasTime: boolean = false;
+  /** 当前拖拽点是否吸附到了整点/半点标记。 */
+  @State dragPreviewSnapped: boolean = false;
   /** 周视图当前每小时高度（双指缩放范围 45~150vp） */
   @State private weekHourHeight: number = MIN_HOUR_HEIGHT;
   /** 日视图当前每小时高度（双指缩放范围 45~150vp） */
@@ -210,6 +219,11 @@ export struct CalendarTab {
   @State private transferMode: string = '';
   /** 待粘贴提示中显示的任务包名称 */
   @State private transferEventName: string = '';
+  /** 两段式粘贴的静态预览位置；第一次点击只更新这些状态。 */
+  @State private transferPreviewDate: string = '';
+  @State private transferPreviewStartMinutes: number = -1;
+  @State private transferPreviewDuration: number = 0;
+  @State private transferPreviewColor: string = '#007AFF';
   /** 当前进入拉伸模式的日程 ID */
   @State private stretchEventId: string = '';
   /** 由自定义长按手势控制显示的日程菜单 ID */
@@ -645,7 +659,9 @@ export struct CalendarTab {
   /** 已完成的日程在标题后展示累计完成次数。 */
   private getEventDisplayTitle(evt: ScheduledEvent): string {
     const completedCount: number = this.getEventCompletionCount(evt);
-    return completedCount > 0 ? `${evt.packageName} · 已完成${completedCount}次` : evt.packageName;
+    const baseTitle: string = completedCount > 0 ?
+      `${evt.packageName} · 已完成${completedCount}次` : evt.packageName;
+    return evt.isCustomized === true ? `${baseTitle} ✎` : baseTitle;
   }
 
   // ==================== 日历计算 ====================
@@ -1281,16 +1297,6 @@ export struct CalendarTab {
       return;
     }
 
-    // 防止同一任务包在同一天重复安排
-    if (scheduleStore.isPackageScheduledOnDate(pkgId, dateStr)) {
-      this.finishPackageDrag();
-      promptAction.showToast({
-        message: `"${pkg.name}" 已安排在此日期`,
-        duration: 2000
-      });
-      return;
-    }
-
     // ---- 计算开始时间 ----
     let sHour: number;
     let sMin: number;
@@ -1334,7 +1340,9 @@ export struct CalendarTab {
       endHour: eHour,
       endMinute: eMin,
       steps: pkg.steps.map((s: TaskStep): TaskStep => ({ name: s.name, duration: s.duration })),
-      reminderEnabled: true
+      reminderEnabled: true,
+      isCustomized: false,
+      actions: copyTaskActions(pkg.actions)
     };
 
     scheduleStore.addEvent(newEvent);
@@ -1378,37 +1386,16 @@ export struct CalendarTab {
 
   // ==================== 周/日视图拖拽 + 吸附 + 预览 ====================
 
-  /**
-   * 根据手指 Y 坐标和滚动偏移量，计算对应时间并吸附到最近的半小时。
-   *
-   * @param y            事件相对于目标组件的 Y 坐标
-   * @param scrollOffset 当前 Scroll 的垂直滚动偏移量
-   * @param hourHeight   每小时对应的高度（vp），周视图 42 / 日视图 60
-   * @returns {hour, minute} 吸附后的时间
-   */
-  private snapTimeFromY(y: number, scrollOffset: number, hourHeight: number): TimeResult {
-    // 网格线和事件块统一下移 GRID_LINE_OFFSET，换算时间时扣回该绘制偏移。
-    const effectiveY: number = y + scrollOffset - GRID_LINE_OFFSET;
-    if (effectiveY < 0) {
-      return { hour: 0, minute: 0 };
-    }
-    // 转换为小时浮点数
-    const hourFloat: number = effectiveY / hourHeight;
-    if (hourFloat >= 24) {
-      return { hour: 23, minute: 30 };
-    }
-    // 吸附到最近的半小时
-    const totalMinutes: number = hourFloat * 60;
-    const snappedMinutes: number = Math.round(totalMinutes / 30) * 30;
-    let hour: number = Math.floor(snappedMinutes / 60);
-    const minute: number = snappedMinutes % 60;
-    if (hour >= 24) {
-      hour = 23;
-    }
-    if (hour < 0) {
-      hour = 0;
-    }
-    return { hour: hour, minute: minute };
+  /** 使用共享几何规则计算五分钟粒度，并仅在阈值内吸附整点/半点。 */
+  private snapTimeFromY(
+    y: number, scrollOffset: number, hourHeight: number, durationMinutes: number
+  ): TimeResult {
+    const placement: TimelinePlacement = resolveTimelinePlacement(
+      y, scrollOffset, hourHeight, 0, GRID_LINE_OFFSET, durationMinutes, 8
+    );
+    this.dragPreviewSnapped = placement.snappedToMarker;
+    const result: TimeResult = { hour: placement.hour, minute: placement.minute };
+    return result;
   }
 
   /** 把 DragEvent 的窗口坐标换算为时间轴可视区域内坐标。 */
@@ -1434,7 +1421,7 @@ export struct CalendarTab {
     }
     const y: number = this.dragLocalY(event, timelineWindowY);
     const snapped: TimeResult =
-      this.snapTimeFromY(y, scrollOffset, hourHeight);
+      this.snapTimeFromY(y, scrollOffset, hourHeight, this.dragPkgTotalMin);
 
     // 计算结束时间
     const endTotalMin: number = snapped.hour * 60 + snapped.minute + this.dragPkgTotalMin;
@@ -1467,23 +1454,27 @@ export struct CalendarTab {
       return;
     }
 
-    const y: number = this.dragLocalY(event, timelineWindowY);
-    const snapped: TimeResult =
-      this.snapTimeFromY(y, scrollOffset, hourHeight);
-
-    this.handleDrop(dateStr, pkgId, snapped.hour, snapped.minute);
+    if (this.dragPreviewVisible && this.dragPreviewHasTime && this.dragPreviewDate === dateStr) {
+      this.handleDrop(dateStr, pkgId, this.dragPreviewHour, this.dragPreviewMinute);
+    } else {
+      const y: number = this.dragLocalY(event, timelineWindowY);
+      const snapped: TimeResult = this.snapTimeFromY(
+        y, scrollOffset, hourHeight, this.dragPkgTotalMin
+      );
+      this.handleDrop(dateStr, pkgId, snapped.hour, snapped.minute);
+    }
     this.activeDragPkgId = '';
   }
 
   /** 拖拽占位框顶部与事件块使用完全相同的时间到像素换算。 */
   private dragPreviewTop(hourHeight: number, startHour: number): number {
     const startMinutes: number = this.dragPreviewHour * 60 + this.dragPreviewMinute;
-    return (startMinutes - startHour * 60) / 60 * hourHeight + GRID_LINE_OFFSET;
+    return timelineMinutesToY(startMinutes, hourHeight, startHour * 60, GRID_LINE_OFFSET);
   }
 
   /** 拖拽占位框高度按任务包总时长计算，并保留最低可见高度。 */
   private dragPreviewHeight(hourHeight: number): number {
-    return Math.max(this.dragPkgTotalMin / 60 * hourHeight, 18);
+    return Math.max(durationMinutesToHeight(this.dragPkgTotalMin, hourHeight), 18);
   }
 
   // ==================== 周/日视图双指缩放 ====================
@@ -1560,6 +1551,8 @@ export struct CalendarTab {
       endHour: evt.endHour,
       endMinute: evt.endMinute,
       reminderEnabled: evt.reminderEnabled,
+      isCustomized: evt.isCustomized,
+      actions: copyTaskActions(evt.actions),
       steps: evt.steps.map((step: TaskStep): TaskStep => ({
         name: step.name,
         duration: step.duration
@@ -1573,6 +1566,10 @@ export struct CalendarTab {
     this.pendingTransferEvent = this.cloneScheduledEvent(evt);
     this.transferEventName = evt.packageName;
     this.transferMode = mode;
+    this.transferPreviewDate = '';
+    this.transferPreviewStartMinutes = -1;
+    this.transferPreviewDuration = getTotalDuration(evt.steps);
+    this.transferPreviewColor = evt.color;
     this.getUIContext().getContextMenuController().close();
     promptAction.showToast({
       message: `已${mode === 'copy' ? '复制' : '剪切'}“${evt.packageName}”，请点击目标时间`,
@@ -1585,20 +1582,47 @@ export struct CalendarTab {
     this.pendingTransferEvent = null;
     this.transferMode = '';
     this.transferEventName = '';
+    this.transferPreviewDate = '';
+    this.transferPreviewStartMinutes = -1;
+    this.transferPreviewDuration = 0;
   }
 
-  /** 将待处理日程粘贴到指定日期和时间；复制生成新 ID，剪切保留原 ID。 */
-  private pasteTransferredEvent(dateStr: string, y: number, hourHeight: number): void {
+  /** 剪切等待确认期间只在 UI 隐藏源事件，不提前删除持久化数据。 */
+  private isCutSourceHidden(evt: ScheduledEvent): boolean {
+    return this.transferMode === 'cut' && this.pendingTransferEvent !== null &&
+      this.pendingTransferEvent.id === evt.id;
+  }
+
+  /**
+   * 两段式粘贴：第一次点击放置/移动虚线框；第二次点击框内才提交。
+   * 复制生成新 ID，剪切保留原 ID。
+   */
+  private handleTransferTargetClick(
+    dateStr: string, y: number, hourHeight: number, visibleStartHour: number
+  ): void {
     if (this.pendingTransferEvent === null || this.transferMode === '') {
       return;
     }
-    const targetTime: TimeResult = this.snapTimeFromY(y, 0, hourHeight);
-    const pasted: ScheduledEvent = this.cloneScheduledEvent(this.pendingTransferEvent);
-    const totalMinutes: number = getTotalDuration(pasted.steps);
-    const startTotalMinutes: number = targetTime.hour * 60 + targetTime.minute;
-    const excludedEventId: string = this.transferMode === 'cut' ? pasted.id : '';
+    const targetPlacement: TimelinePlacement = resolveTimelinePlacement(
+      y, 0, hourHeight, visibleStartHour * 60, GRID_LINE_OFFSET,
+      this.transferPreviewDuration, 8
+    );
+    const clickedMinutes: number = targetPlacement.minutes;
+    const clickedInsidePreview: boolean = this.transferPreviewDate === dateStr &&
+      this.transferPreviewStartMinutes >= 0 &&
+      clickedMinutes >= this.transferPreviewStartMinutes &&
+      clickedMinutes < this.transferPreviewStartMinutes + this.transferPreviewDuration;
+
+    if (clickedInsidePreview) {
+      this.commitTransferredEvent();
+      return;
+    }
+
+    const maxStart: number = Math.max(0, 1440 - this.transferPreviewDuration);
+    const previewStart: number = Math.min(clickedMinutes, maxStart);
+    const excludedEventId: string = this.transferMode === 'cut' ? this.pendingTransferEvent.id : '';
     if (!this.canPlaceScheduledInterval(
-      dateStr, startTotalMinutes, totalMinutes, excludedEventId
+      dateStr, previewStart, this.transferPreviewDuration, excludedEventId
     )) {
       promptAction.showToast({
         message: '该时段已有两个任务包，不能继续安排',
@@ -1606,12 +1630,25 @@ export struct CalendarTab {
       });
       return;
     }
-    const endTotalMinutes: number = startTotalMinutes + totalMinutes;
-    pasted.date = dateStr;
-    pasted.startHour = targetTime.hour;
-    pasted.startMinute = targetTime.minute;
+    this.transferPreviewDate = dateStr;
+    this.transferPreviewStartMinutes = previewStart;
+  }
+
+  /** 第二次点击预览框后一次性提交复制或剪切。 */
+  private commitTransferredEvent(): void {
+    if (this.pendingTransferEvent === null || this.transferMode === '' ||
+      this.transferPreviewDate === '' || this.transferPreviewStartMinutes < 0) {
+      return;
+    }
+    const pasted: ScheduledEvent = this.cloneScheduledEvent(this.pendingTransferEvent);
+    const startTotalMinutes: number = this.transferPreviewStartMinutes;
+    const endTotalMinutes: number = startTotalMinutes + this.transferPreviewDuration;
+    pasted.date = this.transferPreviewDate;
+    pasted.startHour = Math.floor(startTotalMinutes / 60);
+    pasted.startMinute = startTotalMinutes % 60;
     pasted.endHour = Math.floor(endTotalMinutes / 60) % 24;
     pasted.endMinute = endTotalMinutes % 60;
+    pasted.isCustomized = true;
 
     const actionLabel: string = this.transferMode === 'copy' ? '复制' : '移动';
     if (this.transferMode === 'copy') {
@@ -1650,20 +1687,6 @@ export struct CalendarTab {
     }).catch((error: BusinessError) => {
       promptAction.showToast({ message: `分享失败：${error.message}`, duration: 2000 });
     });
-  }
-
-  /** 从长按菜单进入拉伸模式；具体上下边界拖动由事件块手柄处理。 */
-  private enterStretchMode(evt: ScheduledEvent): void {
-    this.contextMenuEventId = '';
-    this.stretchEventId = evt.id;
-    this.stretchPreviewStartMinutes = evt.startHour * 60 + evt.startMinute;
-    this.stretchPreviewDuration = getTotalDuration(evt.steps);
-    this.stretchPreviewSteps = evt.steps.map((step: TaskStep): TaskStep => ({
-      name: step.name,
-      duration: step.duration
-    }));
-    this.getUIContext().getContextMenuController().close();
-    promptAction.showToast({ message: '已进入拉伸模式，请拖动事件块上下边界', duration: 2000 });
   }
 
   // ==================== 日程拉伸 ====================
@@ -1725,6 +1748,7 @@ export struct CalendarTab {
       name: step.name,
       duration: step.duration
     }));
+    updated.isCustomized = true;
     const endTotalMinutes: number = this.stretchPreviewStartMinutes + this.stretchPreviewDuration;
     updated.endHour = Math.floor(endTotalMinutes / 60) % 24;
     updated.endMinute = endTotalMinutes % 60;
@@ -2113,20 +2137,38 @@ export struct CalendarTab {
   @Builder
   buildEventContextMenu(evt: ScheduledEvent): void {
     Menu() {
+      MenuItem({ content: '编辑', labelInfo: '编辑本次安排' })
+        .onClick(() => {
+          this.cancelEventFocus();
+          this.showPackageDetailByEvent(evt);
+        })
       MenuItem({ content: '复制', labelInfo: '点击时间轴粘贴' })
         .onClick(() => { this.prepareEventTransfer(evt, 'copy'); })
       MenuItem({ content: '剪切', labelInfo: '点击时间轴移动' })
         .onClick(() => { this.prepareEventTransfer(evt, 'cut'); })
       MenuItem({ content: '分享' })
         .onClick(() => { this.shareScheduledEvent(evt); })
-      MenuItem({ content: '拉伸', labelInfo: '拖动上下边界' })
-        .onClick(() => { this.enterStretchMode(evt); })
     }
   }
 
-  /** 静止长按识别成功后显示菜单；有位移的手势会先失败并交还给 Scroll。 */
+  /** 静止长按识别成功后进入聚焦态并显示菜单。 */
   private showEventContextMenu(evt: ScheduledEvent): void {
+    this.stretchEventId = evt.id;
+    this.stretchPreviewStartMinutes = evt.startHour * 60 + evt.startMinute;
+    this.stretchPreviewDuration = getTotalDuration(evt.steps);
+    this.stretchPreviewSteps = evt.steps.map((step: TaskStep): TaskStep => ({
+      name: step.name,
+      duration: step.duration
+    }));
     this.contextMenuEventId = evt.id;
+  }
+
+  /** 点击聚焦事件之外的时间轴时退出聚焦，不改动持久化数据。 */
+  private cancelEventFocus(): void {
+    this.contextMenuEventId = '';
+    this.stretchEventId = '';
+    this.stretchOriginalEvent = null;
+    this.stretchPreviewSteps = [];
   }
 
   /** 周视图合并卡内的一行；每个任务仍可独立点击或长按。 */
@@ -2188,7 +2230,9 @@ export struct CalendarTab {
     if (this.transferMode !== '') {
       Row() {
         Text(
-          `${this.transferMode === 'copy' ? '复制' : '剪切'}“${this.transferEventName}”：点击目标时间完成`
+          this.transferPreviewStartMinutes < 0 ?
+            `${this.transferMode === 'copy' ? '复制' : '剪切'}“${this.transferEventName}”：点击目标时间放置` :
+            '点击虚线框内的“+”确认；点击其他时间可移动'
         )
           .fontSize(11)
           .fontColor('#1F5F99')
@@ -2204,6 +2248,35 @@ export struct CalendarTab {
       .width('100%')
       .padding({ left: 10, right: 8, top: 5, bottom: 5 })
       .backgroundColor('#EAF4FF')
+    }
+  }
+
+  /** 复制/剪切第一次点击后显示的静态虚线确认框。 */
+  @Builder
+  buildTransferPastePreview(dateStr: string, hourHeight: number, visibleStartHour: number): void {
+    if (this.transferMode !== '' && this.transferPreviewDate === dateStr &&
+      this.transferPreviewStartMinutes >= 0) {
+      Stack({ alignContent: Alignment.Center }) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor(this.transferPreviewColor)
+          .opacity(0.1)
+        Text('+')
+          .fontSize(22)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(this.transferPreviewColor)
+      }
+      .width('calc(100% - 2px)')
+      .height(Math.max(this.transferPreviewDuration / 60 * hourHeight, 18))
+      .position({
+        x: 1,
+        y: (this.transferPreviewStartMinutes - visibleStartHour * 60) / 60 * hourHeight +
+          GRID_LINE_OFFSET
+      })
+      .border({ width: 1.5, color: this.transferPreviewColor, style: BorderStyle.Dashed })
+      .borderRadius(4)
+      .hitTestBehavior(HitTestMode.None)
     }
   }
 
@@ -2279,7 +2352,7 @@ export struct CalendarTab {
     }
     const minutesFromStart: number =
       (this.nowHour - startHour) * 60 + this.nowMinute + this.nowSecond / 60;
-    return minutesFromStart / 60 * hourHeight;
+    return timelineMinutesToY(minutesFromStart, hourHeight);
   }
 
   // 获取时间指示线的时间字符串
@@ -2869,8 +2942,10 @@ export struct CalendarTab {
                         .backgroundColor(group.first.color)
                         .border({
                           width: this.stretchEventId === group.first.id ? 2 : 0,
-                          color: '#FFFFFF'
+                          color: '#007AFF'
                         })
+                        .blur(this.stretchEventId !== '' &&
+                          this.stretchEventId !== group.first.id ? 6 : 0)
                         .position({
                           x: 1,
                           y: this.eventBlockTop(
@@ -2878,7 +2953,8 @@ export struct CalendarTab {
                           )
                         })
                         .height(this.eventBlockHeight(group.first, this.weekHourHeight, 20))
-                        .opacity(this.isEventCompleted(group.first) ? 0.45 : 1)
+                        .opacity(this.isCutSourceHidden(group.first) ? 0 :
+                          (this.isEventCompleted(group.first) ? 0.45 : 1))
                         .onClick(() => {
                           if (this.stretchEventId !== group.first.id) {
                             this.showPackageDetailByEvent(group.first);
@@ -2933,12 +3009,17 @@ export struct CalendarTab {
                   .hitTestBehavior(HitTestMode.Transparent)
 
                   this.buildTimeAxisDragPreview(day.dateStr, this.weekHourHeight, WEEK_START_HOUR)
+                  this.buildTransferPastePreview(day.dateStr, this.weekHourHeight, WEEK_START_HOUR)
                 }
                 .layoutWeight(1)
                 .backgroundColor(day.isToday ? '#F0F7FF' : '#FFFFFF')
                 .onClick((event: ClickEvent) => {
                   if (this.transferMode !== '') {
-                    this.pasteTransferredEvent(day.dateStr, event.y, this.weekHourHeight);
+                    this.handleTransferTargetClick(
+                      day.dateStr, event.y, this.weekHourHeight, WEEK_START_HOUR
+                    );
+                  } else if (this.stretchEventId !== '') {
+                    this.cancelEventFocus();
                   } else {
                     this.goToDayView(day.dateStr);
                   }
@@ -3185,14 +3266,17 @@ export struct CalendarTab {
                   .backgroundColor(layout.event.color)
                   .border({
                     width: this.stretchEventId === layout.event.id ? 2 : 0,
-                    color: '#FFFFFF'
+                    color: '#007AFF'
                   })
+                  .blur(this.stretchEventId !== '' &&
+                    this.stretchEventId !== layout.event.id ? 6 : 0)
                   .position({
                     x: layout.isOverlapping && layout.column === 1 ? '50%' : 6,
                     y: this.eventBlockTop(layout.event, this.dayHourHeight)
                   })
                   .height(this.eventBlockHeight(layout.event, this.dayHourHeight, 28))
-                  .opacity(this.isEventCompleted(layout.event) ? 0.45 : 1)
+                  .opacity(this.isCutSourceHidden(layout.event) ? 0 :
+                    (this.isEventCompleted(layout.event) ? 0.45 : 1))
                   .onClick(() => {
                     if (this.stretchEventId !== layout.event.id) {
                       this.showPackageDetailByEvent(layout.event);
@@ -3247,12 +3331,17 @@ export struct CalendarTab {
               .hitTestBehavior(HitTestMode.Transparent)
 
               this.buildTimeAxisDragPreview(this.selectedDateStr, this.dayHourHeight, 0)
+              this.buildTransferPastePreview(this.selectedDateStr, this.dayHourHeight, 0)
             }
             .layoutWeight(1)
             .backgroundColor('#FFFFFF')
             .onClick((event: ClickEvent) => {
               if (this.transferMode !== '') {
-                this.pasteTransferredEvent(this.selectedDateStr, event.y, this.dayHourHeight);
+                this.handleTransferTargetClick(
+                  this.selectedDateStr, event.y, this.dayHourHeight, 0
+                );
+              } else if (this.stretchEventId !== '') {
+                this.cancelEventFocus();
               }
             })
             // ---- 日视图拖拽目标 ----
@@ -3330,7 +3419,7 @@ export struct CalendarTab {
     // 加上 GRID_LINE_OFFSET：分割线相对槽位顶部下移了该值，事件块上边界需与分割线对齐
     const startMinutes: number = this.stretchEventId === evt.id ?
       this.stretchPreviewStartMinutes : evt.startHour * 60 + evt.startMinute;
-    return (startMinutes - startHour * 60) / 60 * hourHeight + GRID_LINE_OFFSET;
+    return timelineMinutesToY(startMinutes, hourHeight, startHour * 60, GRID_LINE_OFFSET);
   }
 
   /**
@@ -3340,7 +3429,7 @@ export struct CalendarTab {
   private eventBlockHeight(evt: ScheduledEvent, hourHeight: number, minHeight: number): number {
     const duration: number = this.stretchEventId === evt.id ?
       this.stretchPreviewDuration : getTotalDuration(evt.steps);
-    return Math.max(duration / 60 * hourHeight, minHeight);
+    return Math.max(durationMinutesToHeight(duration, hourHeight), minHeight);
   }
 
   /** 根据事件块的缩放后高度，逐步放宽步骤摘要可显示行数。 */

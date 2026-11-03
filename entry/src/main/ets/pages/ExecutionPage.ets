@@ -1,6 +1,7 @@
 import { promptAction, router, window } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { ExecutionSession, ExecutionStepRecord, executionStore, getStepRemainingMs } from '../models/ExecutionSession';
+import { ActionRunResult, runTaskActions } from '../utils/TaskActionExecutor';
 
 @Entry
 @Component
@@ -23,10 +24,14 @@ struct ExecutionPage {
   aboutToAppear(): void {
     const params: Record<string, string> = router.getParams() as Record<string, string>;
     this.sessionId = params.sessionId || '';
+    executionStore.reconcile(this.sessionId, this.nowMs);
     this.refreshSession();
     if (params.prepare === 'true' && this.session && this.session.status === 'running') {
       this.preparing = executionStore.prepareNewSession(this.session.id);
       this.refreshSession();
+    }
+    if (!this.preparing) {
+      this.runCurrentActions();
     }
     this.setLandscape(true);
     this.tickTimer = setInterval(() => {
@@ -81,6 +86,7 @@ struct ExecutionPage {
       if (this.session) {
         executionStore.resume(this.session.id);
         this.refreshSession();
+        this.runCurrentActions();
       }
       this.preparing = false;
       animateTo({ duration: 420, curve: Curve.EaseInOut }, () => {
@@ -111,14 +117,34 @@ struct ExecutionPage {
     }
     const step: ExecutionStepRecord | undefined = this.session.steps[this.session.currentStepIndex];
     if (step && getStepRemainingMs(step, this.nowMs) === 0) {
-      executionStore.completeCurrentStep(this.session.id, this.nowMs);
+      executionStore.reconcile(this.session.id, this.nowMs);
       this.refreshSession();
+      this.runCurrentActions();
       this.leaveIfFinished();
     }
   }
 
   private currentStep(): ExecutionStepRecord | undefined {
     return this.session?.steps[this.session.currentStepIndex];
+  }
+
+  /** 外部动作失败只提示，不改变执行会话或倒计时。 */
+  private runCurrentActions(): void {
+    if (!this.session || this.session.status !== 'running') {
+      return;
+    }
+    const context: common.UIAbilityContext =
+      this.getUIContext().getHostContext() as common.UIAbilityContext;
+    runTaskActions(context, this.session, 'session-start', this.session.currentStepIndex)
+      .then((results: ActionRunResult[]) => { this.showActionFailures(results); });
+    runTaskActions(context, this.session, 'step-start', this.session.currentStepIndex)
+      .then((results: ActionRunResult[]) => { this.showActionFailures(results); });
+  }
+
+  private showActionFailures(results: ActionRunResult[]): void {
+    if (results.some((result: ActionRunResult) => !result.succeeded)) {
+      promptAction.showToast({ message: '部分关联动作无法打开，计时已继续', duration: 1800 });
+    }
   }
 
   private formatTime(milliseconds: number): string {
@@ -161,6 +187,7 @@ struct ExecutionPage {
       }
       this.confirmedDirection = '';
       this.refreshSession();
+      this.runCurrentActions();
       this.leaveIfFinished();
       return;
     }
@@ -187,6 +214,7 @@ struct ExecutionPage {
       promptAction.showToast({ message: '倒计时已开始', duration: 1800 });
     }
     this.refreshSession();
+    this.runCurrentActions();
   }
 
   private finishTask(): void {
@@ -274,6 +302,7 @@ struct ExecutionPage {
     }
     .width('100%')
     .padding({ top: 22 })
+    .id('execution-progress')
   }
 
   build() {
@@ -289,31 +318,38 @@ struct ExecutionPage {
             .opacity(this.presentationReady ? 1 : 0)
             .scale({ x: this.presentationReady ? 1 : 0.9, y: this.presentationReady ? 1 : 0.9 })
             .animation({ duration: 350, curve: Curve.EaseInOut })
+            .id('execution-timer')
           Text(this.currentStep()!.name)
             .fontSize(28)
             .fontWeight(FontWeight.Medium)
             .fontColor('#FFFFFF')
             .margin({ top: 12 })
             .transition({ type: TransitionType.All, opacity: 0, scale: { x: 0.86, y: 0.86 } })
+            .id('execution-step-name')
           Text(`${this.session.currentStepIndex + 1} / ${this.session.steps.length} · ${this.session.packageName}`)
             .fontSize(14)
             .fontColor('#FFFFFF')
             .opacity(0.78)
             .margin({ top: 8 })
+            .id('execution-title')
           Blank().layoutWeight(1)
           Row({ space: 14 }) {
             if (this.session.status === 'waiting-next') {
               Button('开始下一步')
+                .id('execution-start-next')
                 .onClick(() => {
                   executionStore.startNextStep(this.session!.id);
                   this.refreshSession();
+                  this.runCurrentActions();
                   promptAction.showToast({ message: '倒计时已开始', duration: 1800 });
                 })
             } else {
               Button(this.session.status === 'paused' ? '继续' : '暂停')
+                .id('execution-pause-resume')
                 .onClick(() => { this.togglePause(); })
             }
             Button('结束任务')
+              .id('execution-abandon')
               .fontColor('#FFFFFF')
               .backgroundColor('#FFFFFF33')
               .onClick(() => { this.finishTask(); })
@@ -353,6 +389,7 @@ struct ExecutionPage {
           }
           .width(150)
           .alignItems(HorizontalAlign.Center)
+          .id('execution-previous-step')
           .onClick(() => { this.confirm('previous'); })
 
           Blank().layoutWeight(1)
@@ -368,6 +405,7 @@ struct ExecutionPage {
           }
           .width(150)
           .alignItems(HorizontalAlign.Center)
+          .id('execution-next-step')
           .onClick(() => { this.confirm('next'); })
         }
         .width('100%')
@@ -382,5 +420,6 @@ struct ExecutionPage {
       [SafeAreaType.SYSTEM],
       [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM, SafeAreaEdge.START, SafeAreaEdge.END]
     )
+    .id('execution-page')
   }
 }

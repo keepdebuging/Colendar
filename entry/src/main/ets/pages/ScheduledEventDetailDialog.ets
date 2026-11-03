@@ -2,6 +2,7 @@ import { promptAction, router } from '@kit.ArkUI';
 import { ScheduledEvent, getTotalDuration, scheduleStore } from '../models/ScheduledEvent';
 import { ExecutionSession, executionStore } from '../models/ExecutionSession';
 import { TaskStep } from '../models/TaskPackage';
+import { copyTaskActions } from '../models/TaskAction';
 
 @CustomDialog
 export struct ScheduledEventDetailDialog {
@@ -52,7 +53,9 @@ export struct ScheduledEventDetailDialog {
       endHour: source.endHour,
       endMinute: source.endMinute,
       steps: this.copySteps(source.steps),
-      reminderEnabled: source.reminderEnabled
+      reminderEnabled: source.reminderEnabled,
+      isCustomized: source.isCustomized,
+      actions: copyTaskActions(source.actions)
     };
     return copiedEvent;
   }
@@ -78,6 +81,7 @@ export struct ScheduledEventDetailDialog {
     updated.endHour = Math.floor(endTotal / 60) % 24;
     updated.endMinute = endTotal % 60;
     updated.steps = copiedSteps;
+    updated.isCustomized = true;
     this.event = updated;
     this.startHour = hour;
     this.startMinute = minute;

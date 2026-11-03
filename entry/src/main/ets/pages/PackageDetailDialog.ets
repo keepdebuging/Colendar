@@ -19,9 +19,14 @@
  */
 
 import { promptAction, router } from '@kit.ArkUI';
+import { uniformTypeDescriptor as utd } from '@kit.ArkData';
+import { harmonyShare, systemShare } from '@kit.ShareKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { TaskPackage, TaskStep, generateId } from '../models/TaskPackage';
 import { ScheduledEvent } from '../models/ScheduledEvent';
 import { ExecutionSession, executionStore } from '../models/ExecutionSession';
+import { copyTaskActions } from '../models/TaskAction';
+import { exportTaskPackage } from '../utils/TaskPackageTransfer';
 
 /**
  * 详情弹窗组件
@@ -73,6 +78,9 @@ export struct PackageDetailDialog {
    */
   onEdit?: (pkgId: string) => void;
 
+  /** 由父组件拉起系统分享面板，导出可再次导入的模板文本。 */
+  onExport?: (pkg: TaskPackage) => void;
+
   /**
    * 当需要关闭弹窗时的回调（关闭按钮 / 编辑按钮均触发）。
    *
@@ -80,6 +88,35 @@ export struct PackageDetailDialog {
    * 由父组件调用 ctrl.close() 完成实际关闭操作。
    */
   onClose?: () => void;
+
+  private knockShareCallback: (target: harmonyShare.SharableTarget) => void =
+    (target: harmonyShare.SharableTarget): void => {
+      const data: systemShare.SharedData = new systemShare.SharedData({
+        utd: utd.UniformDataType.PLAIN_TEXT,
+        title: `${this.package.name} · Colendar 任务包`,
+        content: exportTaskPackage(this.package)
+      });
+      target.share(data).catch((error: BusinessError) => {
+        promptAction.showToast({ message: `碰一碰分享失败：${error.message}`, duration: 2200 });
+      });
+    };
+
+  /** 详情页可见期间才注册近场分享，避免后台长期暴露分享内容。 */
+  aboutToAppear(): void {
+    try {
+      harmonyShare.on('knockShare', this.knockShareCallback);
+    } catch (_error) {
+      // 不支持碰一碰或服务未开启时，仍保留普通系统分享入口。
+    }
+  }
+
+  aboutToDisappear(): void {
+    try {
+      harmonyShare.off('knockShare', this.knockShareCallback);
+    } catch (_error) {
+      // 未注册成功时无需额外处理。
+    }
+  }
 
   /**
    * 计算任务包总时长（分钟），用于底部统计信息。
@@ -136,7 +173,8 @@ export struct PackageDetailDialog {
       steps: this.package.steps.map((step: TaskStep) => {
         const copiedStep: TaskStep = { name: step.name, duration: step.duration };
         return copiedStep;
-      })
+      }),
+      actions: copyTaskActions(this.package.actions)
     };
     const session: ExecutionSession | undefined = executionStore.startFromScheduledEvent(quickEvent);
     if (!session) {
@@ -300,6 +338,29 @@ export struct PackageDetailDialog {
           .borderRadius(22)
           .margin({ bottom: 10 })
           .onClick(() => { this.startNow(); })
+
+        Button('导出模板')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.package.color)
+          .backgroundColor('#FFFFFF')
+          .border({ width: 1, color: this.package.color + '80' })
+          .width('calc(100% - 40px)')
+          .height(44)
+          .borderRadius(22)
+          .margin({ bottom: 10 })
+          .onClick(() => {
+            if (this.onExport) {
+              this.onExport(this.package);
+            }
+          })
+
+        Text('详情页打开时可用碰一碰分享；不支持时请使用“导出模板”')
+          .fontSize(11)
+          .fontColor('#999999')
+          .width('100%')
+          .textAlign(TextAlign.Center)
+          .padding({ left: 12, right: 12, bottom: 10 })
 
         // ---- 关闭按钮（通过 onClose 回调通知父组件） ----
         Button('关 闭')

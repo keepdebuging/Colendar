@@ -38,13 +38,53 @@ export default function executionSessionTest() {
       expect(getStepRemainingMs(session.steps[0], 111000)).assertEqual(40000);
     });
 
-    it('does not consume the next step during reconciliation', 0, () => {
+    it('advances across every elapsed step during reconciliation', 0, () => {
       executionStore.sessions = [];
       const session = executionStore.startFromScheduledEvent(sampleEvent, 1000)!;
-      executionStore.reconcile(session.id, 62000);
-      expect(session.status).assertEqual('waiting-next');
+      executionStore.reconcile(session.id, 122000);
+      expect(session.status).assertEqual('completed');
+      expect(session.currentStepIndex).assertEqual(1);
+      expect(session.steps[0].completedAt).assertEqual(61000);
+      expect(session.steps[1].completedAt).assertEqual(121000);
+      expect(session.completedAt).assertEqual(121000);
+    });
+
+    it('keeps a paused session unchanged during reconciliation', 0, () => {
+      executionStore.sessions = [];
+      const session = executionStore.startFromScheduledEvent(sampleEvent, 1000)!;
+      executionStore.pause(session.id, 11000);
+      executionStore.reconcile(session.id, 611000);
+      expect(session.status).assertEqual('paused');
       expect(session.currentStepIndex).assertEqual(0);
-      expect(session.steps[1].status).assertEqual('pending');
+      expect(session.steps[0].remainingMs).assertEqual(50000);
+    });
+
+    it('is idempotent after a session has caught up', 0, () => {
+      executionStore.sessions = [];
+      const session = executionStore.startFromScheduledEvent(sampleEvent, 1000)!;
+      executionStore.reconcile(session.id, 122000);
+      const completedAt: number = session.completedAt;
+      executionStore.reconcile(session.id, 999000);
+      expect(session.status).assertEqual('completed');
+      expect(session.completedAt).assertEqual(completedAt);
+      expect(session.steps[1].completedAt).assertEqual(121000);
+    });
+
+    it('automatically resumes a legacy waiting-next session', 0, () => {
+      executionStore.sessions = [];
+      const session = executionStore.startFromScheduledEvent(sampleEvent, 1000)!;
+      session.steps[0].status = 'completed';
+      session.steps[0].remainingMs = 0;
+      session.steps[0].runStartedAt = 0;
+      session.steps[0].completedAt = 61000;
+      session.status = 'waiting-next';
+      session.updatedAt = 61000;
+
+      executionStore.reconcile(session.id, 90000);
+      expect(session.status).assertEqual('running');
+      expect(session.currentStepIndex).assertEqual(1);
+      expect(session.steps[1].runStartedAt).assertEqual(61000);
+      expect(getStepRemainingMs(session.steps[1], 90000)).assertEqual(31000);
     });
 
     it('creates a new session after the previous run completed', 0, () => {

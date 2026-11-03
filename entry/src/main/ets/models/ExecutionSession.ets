@@ -2,6 +2,7 @@ import { TaskStep } from './TaskPackage';
 import { ScheduledEvent } from './ScheduledEvent';
 import { generateId } from './TaskPackage';
 import { persistence } from './Persistence';
+import { TaskAction, copyTaskActions } from './TaskAction';
 
 export type ExecutionStatus = 'running' | 'paused' | 'waiting-next' | 'completed' | 'abandoned';
 export type ExecutionStepStatus = 'pending' | 'running' | 'completed' | 'skipped';
@@ -24,6 +25,8 @@ export interface ExecutionSession {
   packageName: string;
   color: string;
   steps: ExecutionStepRecord[];
+  actions: TaskAction[];
+  executedActionIds: string[];
   currentStepIndex: number;
   status: ExecutionStatus;
   startedAt: number;
@@ -63,7 +66,9 @@ class ExecutionStore {
     } catch (_err) {
       persistence.writeString(`${EXECUTION_SESSIONS_KEY}_invalid`, raw);
       this.sessions = [];
+      return;
     }
+    this.reconcileActive();
   }
 
   public getSessionById(sessionId: string): ExecutionSession | undefined {
@@ -81,6 +86,14 @@ class ExecutionStore {
       (session: ExecutionSession) => session.scheduledEventId === eventId
     );
     return matches.length > 0 ? matches[matches.length - 1] : undefined;
+  }
+
+  /** 将当前唯一活跃会话按真实时间追赶到 nowMs。 */
+  public reconcileActive(nowMs: number = Date.now()): void {
+    const activeSession: ExecutionSession | undefined = this.getActiveSession();
+    if (activeSession) {
+      this.reconcile(activeSession.id, nowMs);
+    }
   }
 
   public startFromScheduledEvent(event: ScheduledEvent, nowMs: number = Date.now()): ExecutionSession | undefined {
@@ -116,6 +129,8 @@ class ExecutionStore {
       packageName: event.packageName,
       color: event.color,
       steps,
+      actions: copyTaskActions(event.actions),
+      executedActionIds: [],
       currentStepIndex: 0,
       status: 'running',
       startedAt: nowMs,
@@ -250,31 +265,66 @@ class ExecutionStore {
     return true;
   }
 
-  /** Only settles the currently expired step; background time never consumes future steps. */
+  /**
+   * 按真实时间把运行会话追赶到 nowMs。
+   * 后台期间跨过多个步骤时逐项结算，并以每一步的理论结束时间启动下一步。
+   */
   public reconcile(sessionId: string, nowMs: number = Date.now()): void {
     const session: ExecutionSession | undefined = this.getSessionById(sessionId);
-    if (!session || session.status !== 'running') {
+    if (!session || session.status === 'paused' || session.status === 'completed' ||
+      session.status === 'abandoned') {
       return;
     }
-    const step: ExecutionStepRecord | undefined = session.steps[session.currentStepIndex];
-    if (!step || getStepRemainingMs(step, nowMs) > 0) {
-      return;
+
+    let changed: boolean = false;
+
+    // 兼容旧版本留下的 waiting-next：从当时记录的更新时间自动进入下一步。
+    if (session.status === 'waiting-next') {
+      const nextStartedAt: number = session.updatedAt > 0 ? session.updatedAt : nowMs;
+      this.startFollowingStepOrComplete(session, nextStartedAt);
+      changed = true;
     }
-    this.finishCurrentStep(session, nowMs, 'completed');
-    if (session.currentStepIndex >= session.steps.length - 1) {
-      session.status = 'completed';
-      session.completedAt = nowMs;
-    } else {
-      session.status = 'waiting-next';
+
+    while (session.status === 'running') {
+      const step: ExecutionStepRecord | undefined = session.steps[session.currentStepIndex];
+      if (!step || getStepRemainingMs(step, nowMs) > 0) {
+        break;
+      }
+      const completedAt: number = step.runStartedAt > 0 ?
+        step.runStartedAt + Math.max(0, step.remainingMs) : nowMs;
+      this.finishCurrentStep(session, completedAt, 'completed');
+      this.startFollowingStepOrComplete(session, completedAt);
+      changed = true;
     }
-    session.updatedAt = nowMs;
-    this.commit();
+
+    if (changed) {
+      session.updatedAt = nowMs;
+      this.commit();
+    }
   }
 
   public onChange(listener: () => void): void {
     if (this.listeners.indexOf(listener) === -1) {
       this.listeners.push(listener);
     }
+  }
+
+  /** 记录动作已经触发；重复记录同一动作保持幂等。 */
+  public markActionExecuted(sessionId: string, actionId: string): boolean {
+    const session: ExecutionSession | undefined = this.getSessionById(sessionId);
+    if (!session) {
+      return false;
+    }
+    if (!session.executedActionIds) {
+      session.executedActionIds = [];
+    }
+    if (session.executedActionIds.indexOf(actionId) !== -1) {
+      return false;
+    }
+    session.executedActionIds.push(actionId);
+    session.updatedAt = Date.now();
+    this.commit();
+    return true;
   }
 
   public offChange(listener: () => void): void {

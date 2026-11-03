@@ -10,9 +10,19 @@
  * 4. 空状态提示
  */
 
-import { router } from '@kit.ArkUI';
+import { promptAction, router } from '@kit.ArkUI';
+import { common } from '@kit.AbilityKit';
+import { uniformTypeDescriptor as utd } from '@kit.ArkData';
+import { BusinessError } from '@kit.BasicServicesKit';
+import { systemShare } from '@kit.ShareKit';
 import { TaskPackage, taskStore } from '../models/TaskPackage';
 import { PackageDetailDialog } from './PackageDetailDialog';
+import { ImportPackageDialog } from './ImportPackageDialog';
+import {
+  exportTaskPackage,
+  importTaskPackage,
+  TaskPackageImportResult
+} from '../utils/TaskPackageTransfer';
 
 /**
  * 注意：这里使用 @Component 而不是 @Entry，
@@ -42,6 +52,49 @@ export struct TaskPackageTab {
    */
   aboutToAppear(): void {
     this.loadData();
+  }
+
+  showImportDialog(): void {
+    const dialogController: CustomDialogController = new CustomDialogController({
+      builder: ImportPackageDialog({
+        onClose: () => {
+          dialogController.close();
+        },
+        onImport: (text: string) => {
+          const result: TaskPackageImportResult = importTaskPackage(text, taskStore.packages.length);
+          if (!result.package) {
+            promptAction.showToast({ message: result.error, duration: 2200 });
+            return;
+          }
+          taskStore.addPackage(result.package);
+          this.loadData();
+          dialogController.close();
+          promptAction.showToast({ message: '任务包已导入，关联动作默认关闭', duration: 2200 });
+        }
+      }),
+      autoCancel: true,
+      alignment: DialogAlignment.Center,
+      customStyle: true,
+      cornerRadius: 16
+    });
+    dialogController.open();
+  }
+
+  sharePackage(pkg: TaskPackage): void {
+    const sharedData: systemShare.SharedData = new systemShare.SharedData({
+      utd: utd.UniformDataType.PLAIN_TEXT,
+      title: `${pkg.name} · Colendar 任务包`,
+      content: exportTaskPackage(pkg)
+    });
+    const controller: systemShare.ShareController = new systemShare.ShareController(sharedData);
+    const context: common.UIAbilityContext =
+      this.getUIContext().getHostContext() as common.UIAbilityContext;
+    controller.show(context, {
+      selectionMode: systemShare.SelectionMode.SINGLE,
+      previewMode: systemShare.SharePreviewMode.DEFAULT
+    }).catch((error: BusinessError) => {
+      promptAction.showToast({ message: `导出失败：${error.message}`, duration: 2200 });
+    });
   }
 
   /**
@@ -128,6 +181,9 @@ export struct TaskPackageTab {
             url: 'pages/CreatePackage',
             params: { packageId: pkgId }
           });
+        },
+        onExport: (targetPackage: TaskPackage) => {
+          this.sharePackage(targetPackage);
         }
       }),
       /** 点击半透明背景可关闭弹窗 */
@@ -147,13 +203,28 @@ export struct TaskPackageTab {
     Stack({ alignContent: Alignment.BottomEnd }) {
       Column() {
         // ---- 标题栏 ----
-        Text('我的任务包')
-          .fontSize(24)
-          .fontWeight(FontWeight.Bold)
-          .width('100%')
-          .padding(16)
-          .textAlign(TextAlign.Center)
-          .backgroundColor('#F5F5F5')
+        Row() {
+          Blank()
+          Text('我的任务包')
+            .fontSize(24)
+            .fontWeight(FontWeight.Bold)
+            .layoutWeight(1)
+            .textAlign(TextAlign.Center)
+
+          Button('导入')
+            .fontSize(13)
+            .height(32)
+            .borderRadius(16)
+            .fontColor('#007AFF')
+            .backgroundColor('#EAF3FF')
+            .padding({ left: 14, right: 14 })
+            .onClick(() => {
+              this.showImportDialog();
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+        .backgroundColor('#F5F5F5')
 
         // ---- 内容区域 ----
         if (this.packages.length === 0) {

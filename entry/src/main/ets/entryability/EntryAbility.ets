@@ -47,7 +47,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
-    // Ability has brought to foreground
+    // 使用持久化时间戳追赶后台经过的步骤；不依赖后台 setInterval 持续运行。
+    executionStore.reconcileActive();
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
   }
 
