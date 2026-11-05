@@ -4,7 +4,7 @@ import {
   resolveTimelinePlacement,
   timelineMinutesToY,
   timelineYToRawMinutes
-} from '../main/ets/utils/TimelineGeometry';
+} from '../main/ets/calendar/TimelineGeometry';
 
 export default function timelineGeometryTest() {
   describe('timelineGeometryTest', () => {

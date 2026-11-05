@@ -47,10 +47,13 @@ class Persistence {
    */
   public readString(key: string): string {
     if (this.prefs === null) {
-      return '';
+      throw new Error('PERSISTENCE_NOT_INITIALIZED');
     }
     const value: preferences.ValueType = this.prefs.getSync(key, '');
-    return value as string;
+    if (typeof value !== 'string') {
+      throw new Error('PERSISTENCE_VALUE_TYPE_INVALID');
+    }
+    return value;
   }
 
   /**
@@ -61,7 +64,7 @@ class Persistence {
    */
   public writeString(key: string, value: string): void {
     if (this.prefs === null) {
-      return;
+      throw new Error('PERSISTENCE_NOT_INITIALIZED');
     }
     this.prefs.putSync(key, value);
     this.prefs.flushSync();
@@ -70,3 +73,4 @@ class Persistence {
 
 /** 导出全局唯一的持久化持有器实例 */
 export const persistence: Persistence = new Persistence();
+

@@ -20,6 +20,7 @@
 import { router } from '@kit.ArkUI';
 import { TaskStep, TaskPackage, generateId, taskStore, getNextColor } from '../models/TaskPackage';
 import { promptAction } from '@kit.ArkUI';
+import { validateSteps } from '../domain/Validation';
 import { TaskAction, TaskActionTrigger, TaskActionType, copyTaskActions } from '../models/TaskAction';
 
 @Entry
@@ -49,6 +50,7 @@ struct CreatePackage {
   @State steps: TaskStep[] = [
     { name: '', duration: 25 }
   ];
+  @State private saving: boolean = false;
   @State actions: TaskAction[] = [];
 
   // ==================== 生命周期 ====================
@@ -138,11 +140,11 @@ struct CreatePackage {
 
   /**
    * 更新指定索引步骤的时长。
-   * @param value 输入框字符串，parseInt 转换，非数字默认为 0
+   * @param value 输入框字符串；保留小数和非法数值，以便保存时由统一校验拒绝
    */
   updateStepDuration(index: number, value: string): void {
     const newSteps: TaskStep[] = [...this.steps];
-    const durationNum: number = parseInt(value) || 0;
+    const durationNum: number = value.trim() === '' ? 0 : Number(value);
     newSteps[index] = { name: newSteps[index].name, duration: durationNum };
     this.steps = newSteps;
   }
@@ -215,6 +217,9 @@ struct CreatePackage {
    * - 编辑模式：保留原始 id + color → taskStore.updatePackage()
    */
   savePackage(): void {
+    if (this.saving) {
+      return;
+    }
     // ===== 验证 1：任务包名称不能为空 =====
     if (this.packageName.trim().length === 0) {
       promptAction.showToast({
@@ -249,55 +254,52 @@ struct CreatePackage {
       return;
     }
 
-    // ===== 根据模式执行不同操作 =====
-    if (this.isEditMode) {
-      // ---------- 编辑模式：更新已有任务包 ----------
-      const updatedPackage: TaskPackage = {
-        id: this.editPackageId,
-        name: this.packageName.trim(),
-        steps: validSteps,
-        color: this.originalColor,
-        actions: validActions,
-        _version: 0  // 由 updatePackage 内部自增覆盖
-      };
-
-      const success: boolean = taskStore.updatePackage(
-        this.editPackageId, updatedPackage
-      );
-
-      if (success) {
-        promptAction.showToast({
-          message: '保存成功！',
-          duration: 1500
-        });
-      } else {
-        promptAction.showToast({
-          message: '保存失败，任务包可能已被删除',
-          duration: 2000
-        });
-      }
-    } else {
-      // ---------- 创建模式：新增任务包 ----------
-      const newPackage: TaskPackage = {
-        id: generateId(),
-        name: this.packageName.trim(),
-        steps: validSteps,
-        color: getNextColor(taskStore.packages.length),
-        actions: validActions,
-        _version: 0
-      };
-
-      taskStore.addPackage(newPackage);
-
-      promptAction.showToast({
-        message: '创建成功！',
-        duration: 1500
-      });
+    const validationMessage: string = validateSteps(validSteps);
+    if (validationMessage !== '') {
+      promptAction.showToast({ message: validationMessage, duration: 2200 });
+      return;
     }
 
-    // 返回上一页
-    // Index.onPageShow() 会递增 refreshTrigger → Tab 列表自动刷新
-    router.back();
+    this.saving = true;
+    void this.saveValidPackage(validSteps, validActions);
+  }
+
+  private async saveValidPackage(validSteps: TaskStep[], validActions: TaskAction[]): Promise<void> {
+    try {
+      if (this.isEditMode) {
+        const updatedPackage: TaskPackage = {
+          id: this.editPackageId,
+          name: this.packageName.trim(),
+          steps: validSteps,
+          color: this.originalColor,
+          actions: copyTaskActions(validActions),
+          _version: 0
+        };
+        const success: boolean = await taskStore.updatePackage(this.editPackageId, updatedPackage);
+        if (!success) {
+          promptAction.showToast({ message: '保存失败，任务包可能已被删除', duration: 2000 });
+          return;
+        }
+        promptAction.showToast({ message: '保存成功！', duration: 1500 });
+      } else {
+        const newPackage: TaskPackage = {
+          id: generateId(),
+          name: this.packageName.trim(),
+          steps: validSteps,
+          color: getNextColor(taskStore.packages.length),
+          actions: copyTaskActions(validActions),
+          _version: 0
+        };
+        await taskStore.addPackage(newPackage);
+        promptAction.showToast({ message: '创建成功！', duration: 1500 });
+      }
+
+      router.back();
+    } catch (_error) {
+      promptAction.showToast({ message: '保存失败，原数据已保留', duration: 2200 });
+    } finally {
+      this.saving = false;
+    }
   }
 
   // ==================== UI 构建 ====================
@@ -527,6 +529,7 @@ struct CreatePackage {
         .width('calc(100% - 32px)')
         .height(48)
         .borderRadius(24)
+        .enabled(!this.saving)
         .margin(16)
         .onClick(() => {
           this.savePackage();
@@ -537,3 +540,4 @@ struct CreatePackage {
     .backgroundColor('#F0F0F0')
   }
 }
+

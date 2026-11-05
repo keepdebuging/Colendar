@@ -2,7 +2,8 @@ import { promptAction, router } from '@kit.ArkUI';
 import { ScheduledEvent, getTotalDuration, scheduleStore } from '../models/ScheduledEvent';
 import { ExecutionSession, executionStore } from '../models/ExecutionSession';
 import { TaskStep } from '../models/TaskPackage';
-import { copyTaskActions } from '../models/TaskAction';
+import { cloneScheduledEvent, copySteps } from '../domain/EventCopies';
+import { validateInterval, validateSteps } from '../domain/Validation';
 
 @CustomDialog
 export struct ScheduledEventDetailDialog {
@@ -16,6 +17,7 @@ export struct ScheduledEventDetailDialog {
   @State private startMinute: number = 0;
   @State private selectedTime: Date = new Date(2000, 0, 1, 0, 0);
   @State private editedSteps: TaskStep[] = [];
+  @State private saving: boolean = false;
   /** 打开详情时的基线；调整总时长时按此比例重算，以覆盖此前的单步调整。 */
   private originalSteps: TaskStep[] = [];
 
@@ -35,33 +37,15 @@ export struct ScheduledEventDetailDialog {
   }
 
   private copySteps(steps: TaskStep[]): TaskStep[] {
-    return steps.map((step: TaskStep): TaskStep => {
-      const copiedStep: TaskStep = { name: step.name, duration: step.duration };
-      return copiedStep;
-    });
+    return copySteps(steps);
   }
 
   private copyEvent(source: ScheduledEvent): ScheduledEvent {
-    const copiedEvent: ScheduledEvent = {
-      id: source.id,
-      date: source.date,
-      packageId: source.packageId,
-      packageName: source.packageName,
-      color: source.color,
-      startHour: source.startHour,
-      startMinute: source.startMinute,
-      endHour: source.endHour,
-      endMinute: source.endMinute,
-      steps: this.copySteps(source.steps),
-      reminderEnabled: source.reminderEnabled,
-      isCustomized: source.isCustomized,
-      actions: copyTaskActions(source.actions)
-    };
-    return copiedEvent;
+    return cloneScheduledEvent(source);
   }
 
   /** 保存当前日程副本；不会修改任务包模板。 */
-  private saveSchedule(hour: number, minute: number, steps: TaskStep[]): boolean {
+  private async saveSchedule(hour: number, minute: number, steps: TaskStep[]): Promise<boolean> {
     if (!this.event) {
       return false;
     }
@@ -70,6 +54,12 @@ export struct ScheduledEventDetailDialog {
     const totalDuration: number = getTotalDuration(copiedSteps);
     const startTotal: number = hour * 60 + minute;
     const endTotal: number = startTotal + totalDuration;
+    const stepsError: string = validateSteps(copiedSteps);
+    const intervalError: string = validateInterval(startTotal, totalDuration);
+    if (stepsError !== '' || intervalError !== '') {
+      promptAction.showToast({ message: stepsError || intervalError, duration: 2200 });
+      return false;
+    }
     if (!scheduleStore.canPlaceInterval(
       this.event.date, startTotal, totalDuration, this.event.id
     )) {
@@ -78,39 +68,58 @@ export struct ScheduledEventDetailDialog {
     }
     updated.startHour = hour;
     updated.startMinute = minute;
-    updated.endHour = Math.floor(endTotal / 60) % 24;
+    updated.endHour = Math.floor(endTotal / 60);
     updated.endMinute = endTotal % 60;
     updated.steps = copiedSteps;
     updated.isCustomized = true;
-    this.event = updated;
-    this.startHour = hour;
-    this.startMinute = minute;
-    this.editedSteps = copiedSteps;
-    scheduleStore.updateEvent(updated);
+    this.saving = true;
+    try {
+      await scheduleStore.updateEvent(updated);
+      this.event = updated;
+      this.startHour = hour;
+      this.startMinute = minute;
+      this.editedSteps = copiedSteps;
+    } catch (_error) {
+      promptAction.showToast({ message: '保存失败，原日程已保留' });
+      return false;
+    } finally {
+      this.saving = false;
+    }
     return true;
   }
 
-  private toggleReminder(): void {
+  private async toggleReminder(): Promise<void> {
     if (!this.event) {
       return;
     }
     const updated: ScheduledEvent = this.copyEvent(this.event);
-    this.reminderEnabled = !this.reminderEnabled;
-    updated.reminderEnabled = this.reminderEnabled;
+    const nextValue: boolean = !this.reminderEnabled;
+    updated.reminderEnabled = nextValue;
+    try {
+      await scheduleStore.updateEvent(updated);
+    } catch (_error) {
+      promptAction.showToast({ message: '提醒设置保存失败' });
+      return;
+    }
+    this.reminderEnabled = nextValue;
     this.event = updated;
-    scheduleStore.updateEvent(updated);
     promptAction.showToast({
       message: this.reminderEnabled ? '已开启应用内通知' : '已关闭应用内通知',
       duration: 1600
     });
   }
 
-  private deleteSchedule(): void {
+  private async deleteSchedule(): Promise<void> {
     if (!this.event) {
       return;
     }
     const packageName: string = this.event.packageName;
-    scheduleStore.removeEvent(this.event.id);
+    try {
+      await scheduleStore.removeEvent(this.event.id);
+    } catch (_error) {
+      promptAction.showToast({ message: '删除失败，原日程已保留' });
+      return;
+    }
     if (this.onClose) {
       this.onClose();
     }
@@ -118,14 +127,14 @@ export struct ScheduledEventDetailDialog {
   }
 
   /** TimePicker 两列分别滑动；若任务会跨过当天末尾，则吸附到当天最晚可开始时间。 */
-  private changeStartTime(value: TimePickerResult): void {
+  private async changeStartTime(value: TimePickerResult): Promise<void> {
     const duration: number = getTotalDuration(this.editedSteps);
     const latestStart: number = Math.max(0, 1440 - duration);
     const requestedStart: number = value.hour * 60 + value.minute;
     const actualStart: number = Math.min(requestedStart, latestStart);
     const actualHour: number = Math.floor(actualStart / 60);
     const actualMinute: number = actualStart % 60;
-    if (!this.saveSchedule(actualHour, actualMinute, this.editedSteps)) {
+    if (!await this.saveSchedule(actualHour, actualMinute, this.editedSteps)) {
       this.selectedTime = new Date(2000, 0, 1, this.startHour, this.startMinute);
       return;
     }
@@ -135,7 +144,7 @@ export struct ScheduledEventDetailDialog {
     }
   }
 
-  private changeStepDuration(index: number, delta: number): void {
+  private async changeStepDuration(index: number, delta: number): Promise<void> {
     if (index < 0 || index >= this.editedSteps.length) {
       return;
     }
@@ -149,7 +158,7 @@ export struct ScheduledEventDetailDialog {
       return;
     }
     current.duration = nextDuration;
-    this.saveSchedule(this.startHour, this.startMinute, nextSteps);
+    await this.saveSchedule(this.startHour, this.startMinute, nextSteps);
   }
 
   /** 按打开详情时的原始比例缩放；最后一步补齐取整误差。 */
@@ -183,7 +192,7 @@ export struct ScheduledEventDetailDialog {
     return result;
   }
 
-  private changeTotalDuration(delta: number): void {
+  private async changeTotalDuration(delta: number): Promise<void> {
     if (this.originalSteps.length === 0) {
       return;
     }
@@ -198,7 +207,7 @@ export struct ScheduledEventDetailDialog {
       return;
     }
     const scaledSteps: TaskStep[] = this.scaleOriginalSteps(targetTotal);
-    this.saveSchedule(this.startHour, this.startMinute, scaledSteps);
+    await this.saveSchedule(this.startHour, this.startMinute, scaledSteps);
   }
 
   private originalStepDuration(index: number): number {
@@ -213,14 +222,20 @@ export struct ScheduledEventDetailDialog {
       `${this.startMinute.toString().padStart(2, '0')}`;
   }
 
-  private startOrContinue(): void {
+  private async startOrContinue(): Promise<void> {
     if (!this.event) {
       return;
     }
     const previous: ExecutionSession | undefined = executionStore.getLatestSessionByEventId(this.event.id);
     const shouldPrepare: boolean = previous === undefined ||
       previous.status === 'completed' || previous.status === 'abandoned';
-    const session: ExecutionSession | undefined = executionStore.startFromScheduledEvent(this.event);
+    let session: ExecutionSession | undefined;
+    try {
+      session = await executionStore.startFromScheduledEvent(this.event);
+    } catch (_error) {
+      promptAction.showToast({ message: '无法开始任务，请检查步骤时长' });
+      return;
+    }
     if (!session) {
       promptAction.showToast({ message: '请先结束或继续当前正在执行的任务', duration: 2200 });
       return;
@@ -240,6 +255,7 @@ export struct ScheduledEventDetailDialog {
       .width(28)
       .height(28)
       .fontSize(16)
+      .enabled(!this.saving)
       .fontColor(this.event?.color ?? '#007AFF')
       .backgroundColor('#F2F2F2')
       .padding(0)
@@ -263,6 +279,7 @@ export struct ScheduledEventDetailDialog {
             .backgroundColor(this.reminderEnabled ? this.event.color + '18' : '#F2F2F2')
             .height(34)
             .padding({ left: 8, right: 8 })
+            .enabled(!this.saving)
             .onClick(() => { this.toggleReminder(); })
           Button('删除')
             .fontSize(11)
@@ -270,6 +287,7 @@ export struct ScheduledEventDetailDialog {
             .backgroundColor('#FFF0F0')
             .height(34)
             .padding({ left: 9, right: 9 })
+            .enabled(!this.saving)
             .onClick(() => { this.deleteSchedule(); })
         }
         .width('100%')
@@ -281,6 +299,7 @@ export struct ScheduledEventDetailDialog {
             .backgroundColor(this.timePickerVisible ? this.event.color : '#F3F3F3')
             .height(34)
             .padding({ left: 14, right: 14 })
+            .enabled(!this.saving)
             .onClick(() => {
               this.timePickerVisible = !this.timePickerVisible;
               this.durationMenuVisible = false;
@@ -291,6 +310,7 @@ export struct ScheduledEventDetailDialog {
             .backgroundColor(this.durationMenuVisible ? this.event.color : '#F3F3F3')
             .height(34)
             .padding({ left: 14, right: 14 })
+            .enabled(!this.saving)
             .onClick(() => {
               this.durationMenuVisible = !this.durationMenuVisible;
               this.timePickerVisible = false;
@@ -397,3 +417,4 @@ export struct ScheduledEventDetailDialog {
     return session.status === 'completed' || session.status === 'abandoned' ? '再次开始' : '继续任务';
   }
 }
+

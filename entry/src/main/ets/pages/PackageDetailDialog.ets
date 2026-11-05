@@ -25,6 +25,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { TaskPackage, TaskStep, generateId } from '../models/TaskPackage';
 import { ScheduledEvent } from '../models/ScheduledEvent';
 import { ExecutionSession, executionStore } from '../models/ExecutionSession';
+import { validateSteps } from '../domain/Validation';
 import { copyTaskActions } from '../models/TaskAction';
 import { exportTaskPackage } from '../utils/TaskPackageTransfer';
 
@@ -152,9 +153,18 @@ export struct PackageDetailDialog {
   /**
    * 从模板直接开始不会新增日历日程；它只创建带当前模板快照的执行会话。
    */
-  startNow(): void {
-    if (this.package.steps.length === 0) {
-      promptAction.showToast({ message: '请先添加至少一个步骤', duration: 2000 });
+  async startNow(): Promise<void> {
+    const validationMessage: string = validateSteps(this.package.steps);
+    if (validationMessage !== '') {
+      promptAction.showToast({ message: validationMessage, duration: 2000 });
+      return;
+    }
+    const active: ExecutionSession | undefined = executionStore.getActiveSession();
+    if (active) {
+      promptAction.showToast({
+        message: '已有未结束的任务，请通过首页继续执行或结束任务',
+        duration: 2200
+      });
       return;
     }
     const now: Date = new Date();
@@ -168,7 +178,7 @@ export struct PackageDetailDialog {
       color: this.package.color,
       startHour: now.getHours(),
       startMinute: now.getMinutes(),
-      endHour: Math.floor(endMinutes / 60) % 24,
+      endHour: Math.floor(endMinutes / 60),
       endMinute: endMinutes % 60,
       steps: this.package.steps.map((step: TaskStep) => {
         const copiedStep: TaskStep = { name: step.name, duration: step.duration };
@@ -176,7 +186,13 @@ export struct PackageDetailDialog {
       }),
       actions: copyTaskActions(this.package.actions)
     };
-    const session: ExecutionSession | undefined = executionStore.startFromScheduledEvent(quickEvent);
+    let session: ExecutionSession | undefined;
+    try {
+      session = await executionStore.startFromScheduledEvent(quickEvent);
+    } catch (_error) {
+      promptAction.showToast({ message: '无法开始任务，请检查步骤时长', duration: 2200 });
+      return;
+    }
     if (!session) {
       promptAction.showToast({ message: '请先结束或继续当前正在执行的任务', duration: 2200 });
       return;
@@ -385,3 +401,4 @@ export struct PackageDetailDialog {
     .borderRadius(16)
   }
 }
+

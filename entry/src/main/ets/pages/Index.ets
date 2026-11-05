@@ -17,6 +17,8 @@
 
 import { TaskPackageTab } from './TaskPackageTab';
 import { CalendarTab } from './CalendarTab';
+import { promptAction, router } from '@kit.ArkUI';
+import { ExecutionSession, executionStore } from '../models/ExecutionSession';
 
 @Entry
 @Component
@@ -39,22 +41,101 @@ struct Index {
    */
   @Provide refreshTrigger: number = 0;
 
+  @State private activeSessionId: string = '';
+  @State private activeSessionName: string = '';
+  private executionListener: (() => void) | null = null;
+
+  aboutToAppear(): void {
+    this.executionListener = (): void => this.refreshActiveSummary();
+    executionStore.onChange(this.executionListener);
+    this.refreshActiveSummary();
+    void this.reconcileActiveSession();
+  }
+
+  aboutToDisappear(): void {
+    if (this.executionListener !== null) {
+      executionStore.offChange(this.executionListener);
+      this.executionListener = null;
+    }
+  }
+
   /**
    * 每次页面显示时触发（包括从创建页 router.back 返回）
    */
   onPageShow(): void {
     // 递增触发器，通知所有子 Tab 刷新数据
     this.refreshTrigger++;
+    void this.reconcileActiveSession();
+  }
+
+  private refreshActiveSummary(): void {
+    const active: ExecutionSession | undefined = executionStore.getActiveSession();
+    this.activeSessionId = active ? active.id : '';
+    this.activeSessionName = active ? active.packageName : '';
+  }
+
+  private async reconcileActiveSession(): Promise<void> {
+    try {
+      const active: ExecutionSession | undefined = executionStore.getActiveSession();
+      if (active && active.status === 'running') {
+        await executionStore.reconcile(active.id, Date.now());
+      }
+      this.refreshActiveSummary();
+    } catch (_error) {
+      this.refreshActiveSummary();
+      promptAction.showToast({ message: '当前任务恢复失败，请查看恢复页面' });
+    }
+  }
+
+  private continueActiveSession(): void {
+    if (this.activeSessionId === '') {
+      return;
+    }
+    router.pushUrl({
+      url: 'pages/ExecutionPage',
+      params: { sessionId: this.activeSessionId, prepare: 'false' }
+    });
+  }
+
+  private async abandonActiveSession(): Promise<void> {
+    const active: ExecutionSession | undefined = executionStore.getActiveSession();
+    if (!active) {
+      this.refreshActiveSummary();
+      return;
+    }
+    try {
+      await executionStore.abandon(active.id);
+      this.refreshActiveSummary();
+      promptAction.showToast({ message: '任务已结束' });
+    } catch (_error) {
+      promptAction.showToast({ message: '结束失败，原任务仍保留' });
+    }
   }
 
   build() {
-    /**
+    Column() {
+      if (this.activeSessionId !== '') {
+        Row({ space: 8 }) {
+          Text(`进行中的任务：${this.activeSessionName}`)
+            .layoutWeight(1)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Button('继续执行')
+            .onClick(() => this.continueActiveSession())
+          Button('结束')
+            .onClick(() => { void this.abandonActiveSession(); })
+        }
+        .padding(12)
+        .width('100%')
+        .backgroundColor('#EAF3FF')
+      }
+      /**
      * Tabs 组件：底部导航栏容器
      *
      * barPosition: BarPosition.End → 导航栏在底部
      * index: this.currentTabIndex → 绑定当前选中的 Tab
      */
-    Tabs({
+      Tabs({
       barPosition: BarPosition.End,
       index: this.currentTabIndex
     }) {
@@ -73,21 +154,23 @@ struct Index {
         CalendarTab()
       }
       .tabBar(this.TabBarBuilder('日历', 1, '📅'))
-    }
-    .width('100%')
-    .height('100%')
-    .barWidth('100%')
-    .barHeight(56)
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .barWidth('100%')
+      .barHeight(56)
+      .id('main-tabs')
     /**
      * onChange：当用户点击底部导航切换 Tab 时触发
      * 我们在此刷新数据，确保日历页和任务包页都是最新的
      */
-    .onChange((index: number) => {
-      this.currentTabIndex = index;
-      // 切换 Tab 时刷新数据
-      this.refreshTrigger++;
-    })
-    .id('main-tabs')
+      .onChange((index: number) => {
+        this.currentTabIndex = index;
+        this.refreshTrigger++;
+      })
+    }
+    .width('100%')
+    .height('100%')
   }
 
   /**
@@ -118,3 +201,4 @@ struct Index {
     .id(tabIndex === 0 ? 'tab-packages' : 'tab-calendar')
   }
 }
+

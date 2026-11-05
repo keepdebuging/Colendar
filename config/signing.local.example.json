@@ -1,0 +1,15 @@
+{
+  "signingConfig": {
+    "name": "local",
+    "type": "HarmonyOS",
+    "material": {
+      "certpath": "REPLACE_WITH_LOCAL_CERTIFICATE_PATH",
+      "keyAlias": "REPLACE_WITH_LOCAL_KEY_ALIAS",
+      "keyPassword": "REPLACE_WITH_LOCAL_KEY_PASSWORD",
+      "profile": "REPLACE_WITH_LOCAL_PROFILE_PATH",
+      "signAlg": "SHA256withECDSA",
+      "storeFile": "REPLACE_WITH_LOCAL_KEYSTORE_PATH",
+      "storePassword": "REPLACE_WITH_LOCAL_STORE_PASSWORD"
+    }
+  }
+}

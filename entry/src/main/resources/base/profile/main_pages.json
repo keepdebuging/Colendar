@@ -1,5 +1,7 @@
 {
   "src": [
+    "pages/Bootstrap",
+    "pages/RecoveryPage",
     "pages/Index",
     "pages/CreatePackage",
     "pages/ExecutionPage"

@@ -1,0 +1,25 @@
+name: HarmonyOS verification
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: [self-hosted, windows, harmonyos-sdk]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install OHPM dependencies
+        shell: pwsh
+        run: ohpm install
+      - name: Build HAP
+        shell: pwsh
+        run: ./scripts/build-check.ps1
+      - name: Run registered business tests
+        shell: pwsh
+        run: ./scripts/test-check.ps1

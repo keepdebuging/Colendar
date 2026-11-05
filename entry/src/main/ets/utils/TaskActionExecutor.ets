@@ -30,8 +30,10 @@ async function executeAction(context: common.UIAbilityContext, action: TaskActio
 
 /** Execute each enabled action at most once for its trigger key. */
 export async function runTaskActions(
-  context: common.UIAbilityContext, session: ExecutionSession,
-  trigger: TaskActionTrigger, stepIndex: number
+  context: common.UIAbilityContext,
+  session: ExecutionSession,
+  trigger: TaskActionTrigger,
+  stepIndex: number
 ): Promise<ActionRunResult[]> {
   const results: ActionRunResult[] = [];
   const executed: string[] = session.executedActionIds || [];
@@ -43,7 +45,11 @@ export async function runTaskActions(
     if (executed.indexOf(key) !== -1) {
       continue;
     }
-    executionStore.markActionExecuted(session.id, key);
+    const recorded: boolean = await executionStore.markActionExecuted(session.id, key);
+    if (!recorded) {
+      continue;
+    }
+    executed.push(key);
     let succeeded: boolean = true;
     try {
       await executeAction(context, action);
