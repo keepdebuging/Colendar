@@ -2,19 +2,15 @@ import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.Ab
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { persistence } from '../models/Persistence';
-import { taskStore } from '../models/TaskPackage';
-import { scheduleStore } from '../models/ScheduledEvent';
 import { executionStore } from '../models/ExecutionSession';
+import { reportError } from '../diagnostics/AppLogger';
 
 const DOMAIN = 0x0000;
 
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
-    // 初始化持久化并恢复数据（早于 loadContent，保证首页渲染时数据已就绪）
+    // 先初始化存储；具体恢复由 Bootstrap 页面执行，失败时仍能展示恢复入口。
     persistence.init(this.context);
-    taskStore.restore();
-    scheduleStore.restore();
-    executionStore.restore();
 
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
@@ -32,7 +28,7 @@ export default class EntryAbility extends UIAbility {
     // Main window is created, set main page for this ability
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
 
-    windowStage.loadContent('pages/Index', (err) => {
+    windowStage.loadContent('pages/Bootstrap', (err) => {
       if (err.code) {
         hilog.error(DOMAIN, 'testTag', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
         return;
@@ -47,8 +43,10 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
-    // 使用持久化时间戳追赶后台经过的步骤；不依赖后台 setInterval 持续运行。
-    executionStore.reconcileActive();
+    // 返回前台时结算当前已过期步骤；状态仍保存在本地快照中。
+    void executionStore.reconcileActive().catch((_error: Error) => {
+      reportError('execution.reconcile', 'FOREGROUND_RECONCILE_FAILED');
+    });
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
   }
 
@@ -57,3 +55,4 @@ export default class EntryAbility extends UIAbility {
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
   }
 }
+

@@ -1,51 +1,88 @@
 import { describe, it, expect } from '@ohos/hypium';
 import { ScheduledEvent, scheduleStore } from '../main/ets/models/ScheduledEvent';
-import { TaskPackage } from '../main/ets/models/TaskPackage';
+import { TaskPackage, taskStore } from '../main/ets/models/TaskPackage';
+import { SnapshotEnvelope } from '../main/ets/types/Models';
+import { SnapshotRepository } from '../main/ets/storage/SnapshotRepository';
+import { appStore } from '../main/ets/state/AppStore';
 
-function createEvent(id: string, customized: boolean): ScheduledEvent {
+class MemorySnapshotRepository extends SnapshotRepository {
+  private raw: string = '';
+
+  public readRaw(): string {
+    return this.raw;
+  }
+
+  public readLegacy(_key: string): string {
+    return '';
+  }
+
+  public save(envelope: SnapshotEnvelope): void {
+    this.raw = JSON.stringify(envelope);
+  }
+}
+
+function resetStore(): void {
+  appStore.configureRepositoryForTesting(new MemorySnapshotRepository());
+}
+
+function createPackage(): TaskPackage {
+  return {
+    id: 'package-1',
+    name: '原任务包',
+    color: '#007AFF',
+    steps: [{ name: '原步骤', duration: 30 }],
+    _version: 0
+  };
+}
+
+function createEvent(id: string, customized: boolean, startHour: number = 9): ScheduledEvent {
   return {
     id,
     date: '2026-10-29',
     packageId: 'package-1',
     packageName: customized ? '单次定制' : '原任务包',
     color: customized ? '#FF9500' : '#007AFF',
-    startHour: 9,
+    startHour,
     startMinute: 0,
-    endHour: 9,
+    endHour: startHour,
     endMinute: 30,
     steps: [{ name: customized ? '定制步骤' : '原步骤', duration: 30 }],
-    isCustomized: customized
+    isCustomized: customized,
+    sourcePackageVersion: 0
   };
 }
 
 export default function scheduleStoreTest() {
   describe('scheduleStoreTest', () => {
-    it('keeps customized event isolated from its source package', 0, () => {
-      const normal: ScheduledEvent = createEvent('event-normal', false);
-      const customized: ScheduledEvent = createEvent('event-customized', true);
-      scheduleStore.events = [normal, customized];
+    it('keeps scheduled snapshots unchanged when the source package changes', 0, async () => {
+      resetStore();
+      const originalPackage: TaskPackage = createPackage();
+      await taskStore.addPackage(originalPackage);
+      await scheduleStore.addEvent(createEvent('event-normal', false));
+      await scheduleStore.addEvent(createEvent('event-customized', true));
+
       const updatedPackage: TaskPackage = {
-        id: 'package-1',
+        id: originalPackage.id,
         name: '母任务包新名称',
         color: '#34C759',
         steps: [{ name: '母模板新步骤', duration: 45 }],
-        _version: 1
+        _version: 0
       };
+      await taskStore.updatePackage(originalPackage.id, updatedPackage);
 
-      scheduleStore.syncPackageFields(updatedPackage);
-
-      expect(normal.packageName).assertEqual('母任务包新名称');
-      expect(normal.steps[0].duration).assertEqual(45);
-      expect(customized.packageName).assertEqual('单次定制');
-      expect(customized.steps[0].name).assertEqual('定制步骤');
-      expect(customized.steps[0].duration).assertEqual(30);
+      const normal: ScheduledEvent | undefined = scheduleStore.getEventById('event-normal');
+      const customized: ScheduledEvent | undefined = scheduleStore.getEventById('event-customized');
+      expect(normal?.packageName).assertEqual('原任务包');
+      expect(normal?.steps[0].duration).assertEqual(30);
+      expect(customized?.packageName).assertEqual('单次定制');
+      expect(customized?.steps[0].name).assertEqual('定制步骤');
+      expect(customized?.steps[0].duration).assertEqual(30);
     });
 
-    it('locates each repeated schedule by event id', 0, () => {
-      const first: ScheduledEvent = createEvent('event-first', false);
-      const second: ScheduledEvent = createEvent('event-second', false);
-      second.startHour = 14;
-      scheduleStore.events = [first, second];
+    it('locates repeated schedules by event id', 0, async () => {
+      resetStore();
+      await scheduleStore.addEvent(createEvent('event-first', false, 9));
+      await scheduleStore.addEvent(createEvent('event-second', false, 14));
 
       expect(scheduleStore.getEventById('event-first')?.startHour).assertEqual(9);
       expect(scheduleStore.getEventById('event-second')?.startHour).assertEqual(14);

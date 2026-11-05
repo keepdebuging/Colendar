@@ -1,46 +1,19 @@
-import { TaskStep } from './TaskPackage';
-import { ScheduledEvent } from './ScheduledEvent';
+import {
+  ExecutionSession as ExecutionSessionModel,
+  ExecutionStepRecord as ExecutionStepRecordModel,
+  ExecutionStatus,
+  ExecutionStepStatus,
+  ScheduledEvent,
+  TaskStep
+} from '../types/Models';
 import { generateId } from './TaskPackage';
-import { persistence } from './Persistence';
-import { TaskAction, copyTaskActions } from './TaskAction';
+import { validateEvent } from '../domain/Validation';
+import { appStore } from '../state/AppStore';
+import { copyTaskActions } from './TaskAction';
 
-export type ExecutionStatus = 'running' | 'paused' | 'waiting-next' | 'completed' | 'abandoned';
-export type ExecutionStepStatus = 'pending' | 'running' | 'completed' | 'skipped';
-
-export interface ExecutionStepRecord {
-  index: number;
-  name: string;
-  plannedDurationMs: number;
-  status: ExecutionStepStatus;
-  elapsedActiveMs: number;
-  runStartedAt: number;
-  remainingMs: number;
-  completedAt: number;
-}
-
-export interface ExecutionSession {
-  id: string;
-  scheduledEventId: string;
-  sourcePackageId: string;
-  packageName: string;
-  color: string;
-  steps: ExecutionStepRecord[];
-  actions: TaskAction[];
-  executedActionIds: string[];
-  currentStepIndex: number;
-  status: ExecutionStatus;
-  startedAt: number;
-  completedAt: number;
-  updatedAt: number;
-}
-
-interface ExecutionStorePayload {
-  schemaVersion: number;
-  sessions: ExecutionSession[];
-}
-
-const EXECUTION_SESSIONS_KEY: string = 'execution_sessions_v1';
-const EXECUTION_SCHEMA_VERSION: number = 1;
+export type { ExecutionStatus, ExecutionStepStatus } from '../types/Models';
+export interface ExecutionStepRecord extends ExecutionStepRecordModel {}
+export interface ExecutionSession extends ExecutionSessionModel {}
 
 export function getStepRemainingMs(step: ExecutionStepRecord, nowMs: number): number {
   if (step.status !== 'running' || step.runStartedAt === 0) {
@@ -49,26 +22,17 @@ export function getStepRemainingMs(step: ExecutionStepRecord, nowMs: number): nu
   return Math.max(0, step.remainingMs - (nowMs - step.runStartedAt));
 }
 
+type SessionChange = (session: ExecutionSession) => boolean;
+
 class ExecutionStore {
-  public sessions: ExecutionSession[] = [];
   private listeners: Array<() => void> = [];
 
+  public get sessions(): ExecutionSession[] {
+    return appStore.snapshot.sessions as ExecutionSession[];
+  }
+
   public restore(): void {
-    const raw: string = persistence.readString(EXECUTION_SESSIONS_KEY);
-    if (raw === '') {
-      return;
-    }
-    try {
-      const payload: ExecutionStorePayload = JSON.parse(raw) as ExecutionStorePayload;
-      if (payload.schemaVersion === EXECUTION_SCHEMA_VERSION && Array.isArray(payload.sessions)) {
-        this.sessions = payload.sessions;
-      }
-    } catch (_err) {
-      persistence.writeString(`${EXECUTION_SESSIONS_KEY}_invalid`, raw);
-      this.sessions = [];
-      return;
-    }
-    this.reconcileActive();
+    appStore.restore();
   }
 
   public getSessionById(sessionId: string): ExecutionSession | undefined {
@@ -76,9 +40,15 @@ class ExecutionStore {
   }
 
   public getActiveSession(): ExecutionSession | undefined {
-    return this.sessions.find((session: ExecutionSession) =>
-      session.status === 'running' || session.status === 'paused' || session.status === 'waiting-next'
-    );
+    return this.sessions.find((session: ExecutionSession) => this.isActive(session));
+  }
+
+  /** Reconcile the single active session after the app returns to the foreground. */
+  public async reconcileActive(nowMs: number = Date.now()): Promise<void> {
+    const active: ExecutionSession | undefined = this.getActiveSession();
+    if (active && active.status === 'running') {
+      await this.reconcile(active.id, nowMs);
+    }
   }
 
   public getLatestSessionByEventId(eventId: string): ExecutionSession | undefined {
@@ -88,25 +58,23 @@ class ExecutionStore {
     return matches.length > 0 ? matches[matches.length - 1] : undefined;
   }
 
-  /** 将当前唯一活跃会话按真实时间追赶到 nowMs。 */
-  public reconcileActive(nowMs: number = Date.now()): void {
-    const activeSession: ExecutionSession | undefined = this.getActiveSession();
-    if (activeSession) {
-      this.reconcile(activeSession.id, nowMs);
-    }
-  }
-
-  public startFromScheduledEvent(event: ScheduledEvent, nowMs: number = Date.now()): ExecutionSession | undefined {
+  public async startFromScheduledEvent(
+    event: ScheduledEvent,
+    nowMs: number = Date.now()
+  ): Promise<ExecutionSession | undefined> {
     const latest: ExecutionSession | undefined = this.getLatestSessionByEventId(event.id);
-    if (latest && (latest.status === 'running' || latest.status === 'paused' ||
-      latest.status === 'waiting-next')) {
+    if (latest && this.isActive(latest)) {
       return latest;
     }
     if (this.getActiveSession()) {
       return undefined;
     }
+    const validationError: string = validateEvent(event);
+    if (validationError !== '') {
+      throw new Error(validationError);
+    }
     const steps: ExecutionStepRecord[] = event.steps.map((step: TaskStep, index: number) => {
-      const duration: number = Math.max(1, step.duration) * 60000;
+      const duration: number = step.duration * 60000;
       const record: ExecutionStepRecord = {
         index,
         name: step.name,
@@ -119,9 +87,6 @@ class ExecutionStore {
       };
       return record;
     });
-    if (steps.length === 0) {
-      return undefined;
-    }
     const session: ExecutionSession = {
       id: generateId(),
       scheduledEventId: event.id,
@@ -137,170 +102,209 @@ class ExecutionStore {
       completedAt: 0,
       updatedAt: nowMs
     };
-    this.sessions.push(session);
-    this.commit();
+    await appStore.mutate((draft) => {
+      if (draft.sessions.some((candidate) => this.isActive(candidate))) {
+        throw new Error('已有未结束的任务');
+      }
+      draft.sessions.push(session);
+    });
+    this.notifyChange();
     return session;
   }
 
-  /** Holds a brand-new session at its full first-step duration during the 3-2-1 preparation. */
-  public prepareNewSession(sessionId: string, nowMs: number = Date.now()): boolean {
-    const session: ExecutionSession | undefined = this.getSessionById(sessionId);
-    if (!session || session.status !== 'running' || session.currentStepIndex !== 0) {
+  /** Holds a brand-new session at its full first-step duration during preparation. */
+  public async prepareNewSession(sessionId: string, nowMs: number = Date.now()): Promise<boolean> {
+    const current: ExecutionSession | undefined = this.getSessionById(sessionId);
+    if (!current || current.status !== 'running' || current.currentStepIndex !== 0 || !current.steps[0]) {
       return false;
     }
-    const firstStep: ExecutionStepRecord | undefined = session.steps[0];
-    if (!firstStep) {
-      return false;
-    }
-    firstStep.status = 'running';
-    firstStep.elapsedActiveMs = 0;
-    firstStep.remainingMs = firstStep.plannedDurationMs;
-    firstStep.runStartedAt = 0;
-    firstStep.completedAt = 0;
-    session.status = 'paused';
-    session.updatedAt = nowMs;
-    this.commit();
-    return true;
+    const expectedStepIndex: number = current.currentStepIndex;
+    return this.mutateSession(sessionId, (session) => {
+      if (session.status !== 'running' || session.currentStepIndex !== expectedStepIndex) {
+        return false;
+      }
+      const firstStep: ExecutionStepRecord = session.steps[0];
+      firstStep.status = 'running';
+      firstStep.elapsedActiveMs = 0;
+      firstStep.remainingMs = firstStep.plannedDurationMs;
+      firstStep.runStartedAt = 0;
+      firstStep.completedAt = 0;
+      session.status = 'paused';
+      session.updatedAt = nowMs;
+      return true;
+    });
   }
 
-  public pause(sessionId: string, nowMs: number = Date.now()): boolean {
-    const session: ExecutionSession | undefined = this.getSessionById(sessionId);
-    if (!session || session.status !== 'running') {
+  public async pause(sessionId: string, nowMs: number = Date.now()): Promise<boolean> {
+    const current: ExecutionSession | undefined = this.getSessionById(sessionId);
+    if (!current || current.status !== 'running') {
       return false;
     }
-    this.settleRunningStep(session, nowMs);
-    session.status = 'paused';
-    session.updatedAt = nowMs;
-    this.commit();
-    return true;
-  }
-
-  public resume(sessionId: string, nowMs: number = Date.now()): boolean {
-    const session: ExecutionSession | undefined = this.getSessionById(sessionId);
-    if (!session || session.status !== 'paused') {
-      return false;
-    }
-    const step: ExecutionStepRecord | undefined = session.steps[session.currentStepIndex];
-    if (!step || step.remainingMs <= 0) {
-      return false;
-    }
-    step.status = 'running';
-    step.runStartedAt = nowMs;
-    session.status = 'running';
-    session.updatedAt = nowMs;
-    this.commit();
-    return true;
-  }
-
-  public completeCurrentStep(sessionId: string, nowMs: number = Date.now()): boolean {
-    const session: ExecutionSession | undefined = this.getSessionById(sessionId);
-    if (!session || (session.status !== 'running' && session.status !== 'paused')) {
-      return false;
-    }
-    this.finishCurrentStep(session, nowMs, 'completed');
-    this.startFollowingStepOrComplete(session, nowMs);
-    this.commit();
-    return true;
-  }
-
-  public skipCurrentStep(sessionId: string, nowMs: number = Date.now()): boolean {
-    const session: ExecutionSession | undefined = this.getSessionById(sessionId);
-    if (!session || (session.status !== 'running' && session.status !== 'paused')) {
-      return false;
-    }
-    this.finishCurrentStep(session, nowMs, 'skipped');
-    this.startFollowingStepOrComplete(session, nowMs);
-    this.commit();
-    return true;
-  }
-
-  public startNextStep(sessionId: string, nowMs: number = Date.now()): boolean {
-    const session: ExecutionSession | undefined = this.getSessionById(sessionId);
-    if (!session || session.status !== 'waiting-next') {
-      return false;
-    }
-    this.startFollowingStepOrComplete(session, nowMs);
-    this.commit();
-    return true;
-  }
-
-  /** Reopens the immediately preceding chapter and makes it the active timer. */
-  public restartPreviousStep(sessionId: string, nowMs: number = Date.now()): boolean {
-    const session: ExecutionSession | undefined = this.getSessionById(sessionId);
-    if (!session || session.currentStepIndex === 0 ||
-      (session.status !== 'running' && session.status !== 'paused')) {
-      return false;
-    }
-    if (session.status === 'running') {
+    const expectedStepIndex: number = current.currentStepIndex;
+    return this.mutateSession(sessionId, (session) => {
+      if (session.status !== 'running' || session.currentStepIndex !== expectedStepIndex) {
+        return false;
+      }
       this.settleRunningStep(session, nowMs);
-    }
-    const current: ExecutionStepRecord = session.steps[session.currentStepIndex];
-    current.status = 'pending';
-    current.runStartedAt = 0;
-    const previous: ExecutionStepRecord = session.steps[session.currentStepIndex - 1];
-    previous.status = 'running';
-    previous.elapsedActiveMs = 0;
-    previous.remainingMs = previous.plannedDurationMs;
-    previous.runStartedAt = nowMs;
-    previous.completedAt = 0;
-    session.currentStepIndex--;
-    session.status = 'running';
-    session.updatedAt = nowMs;
-    this.commit();
-    return true;
+      session.status = 'paused';
+      session.updatedAt = nowMs;
+      return true;
+    });
   }
 
-  public abandon(sessionId: string, nowMs: number = Date.now()): boolean {
-    const session: ExecutionSession | undefined = this.getSessionById(sessionId);
-    if (!session || session.status === 'completed' || session.status === 'abandoned') {
+  public async resume(sessionId: string, nowMs: number = Date.now()): Promise<boolean> {
+    const current: ExecutionSession | undefined = this.getSessionById(sessionId);
+    if (!current || current.status !== 'paused') {
       return false;
     }
-    if (session.status === 'running') {
-      this.settleRunningStep(session, nowMs);
+    const expectedStepIndex: number = current.currentStepIndex;
+    const currentStep: ExecutionStepRecord | undefined = current.steps[current.currentStepIndex];
+    if (!currentStep || currentStep.remainingMs <= 0) {
+      return false;
     }
-    session.status = 'abandoned';
-    session.completedAt = nowMs;
-    session.updatedAt = nowMs;
-    this.commit();
-    return true;
+    return this.mutateSession(sessionId, (session) => {
+      if (session.status !== 'paused' || session.currentStepIndex !== expectedStepIndex) {
+        return false;
+      }
+      const step: ExecutionStepRecord = session.steps[expectedStepIndex];
+      step.status = 'running';
+      step.runStartedAt = nowMs;
+      session.status = 'running';
+      session.updatedAt = nowMs;
+      return true;
+    });
   }
 
-  /**
-   * 按真实时间把运行会话追赶到 nowMs。
-   * 后台期间跨过多个步骤时逐项结算，并以每一步的理论结束时间启动下一步。
-   */
-  public reconcile(sessionId: string, nowMs: number = Date.now()): void {
-    const session: ExecutionSession | undefined = this.getSessionById(sessionId);
-    if (!session || session.status === 'paused' || session.status === 'completed' ||
-      session.status === 'abandoned') {
+  public async completeCurrentStep(sessionId: string, nowMs: number = Date.now()): Promise<boolean> {
+    const current: ExecutionSession | undefined = this.getSessionById(sessionId);
+    if (!current || (current.status !== 'running' && current.status !== 'paused')) {
+      return false;
+    }
+    const expectedStepIndex: number = current.currentStepIndex;
+    const expectedStatus: ExecutionStatus = current.status;
+    return this.mutateSession(sessionId, (session) => {
+      if (session.currentStepIndex !== expectedStepIndex || session.status !== expectedStatus ||
+        (session.status !== 'running' && session.status !== 'paused')) {
+        return false;
+      }
+      this.finishCurrentStep(session, nowMs, 'completed');
+      this.startFollowingStepOrComplete(session, nowMs);
+      return true;
+    });
+  }
+
+  public async skipCurrentStep(sessionId: string, nowMs: number = Date.now()): Promise<boolean> {
+    const current: ExecutionSession | undefined = this.getSessionById(sessionId);
+    if (!current || (current.status !== 'running' && current.status !== 'paused')) {
+      return false;
+    }
+    const expectedStepIndex: number = current.currentStepIndex;
+    const expectedStatus: ExecutionStatus = current.status;
+    return this.mutateSession(sessionId, (session) => {
+      if (session.currentStepIndex !== expectedStepIndex || session.status !== expectedStatus ||
+        (session.status !== 'running' && session.status !== 'paused')) {
+        return false;
+      }
+      this.finishCurrentStep(session, nowMs, 'skipped');
+      this.startFollowingStepOrComplete(session, nowMs);
+      return true;
+    });
+  }
+
+  public async startNextStep(sessionId: string, nowMs: number = Date.now()): Promise<boolean> {
+    const current: ExecutionSession | undefined = this.getSessionById(sessionId);
+    if (!current || current.status !== 'waiting-next') {
+      return false;
+    }
+    const expectedStepIndex: number = current.currentStepIndex;
+    return this.mutateSession(sessionId, (session) => {
+      if (session.status !== 'waiting-next' || session.currentStepIndex !== expectedStepIndex) {
+        return false;
+      }
+      this.startFollowingStepOrComplete(session, nowMs);
+      return true;
+    });
+  }
+
+  public async restartPreviousStep(sessionId: string, nowMs: number = Date.now()): Promise<boolean> {
+    const current: ExecutionSession | undefined = this.getSessionById(sessionId);
+    if (!current || current.currentStepIndex === 0 ||
+      (current.status !== 'running' && current.status !== 'paused')) {
+      return false;
+    }
+    const expectedStepIndex: number = current.currentStepIndex;
+    const expectedStatus: ExecutionStatus = current.status;
+    return this.mutateSession(sessionId, (session) => {
+      if (session.currentStepIndex !== expectedStepIndex || session.status !== expectedStatus ||
+        (session.status !== 'running' && session.status !== 'paused')) {
+        return false;
+      }
+      if (session.status === 'running') {
+        this.settleRunningStep(session, nowMs);
+      }
+      const active: ExecutionStepRecord = session.steps[session.currentStepIndex];
+      active.status = 'pending';
+      active.runStartedAt = 0;
+      const previous: ExecutionStepRecord = session.steps[session.currentStepIndex - 1];
+      previous.status = 'running';
+      previous.elapsedActiveMs = 0;
+      previous.remainingMs = previous.plannedDurationMs;
+      previous.runStartedAt = nowMs;
+      previous.completedAt = 0;
+      session.currentStepIndex--;
+      session.status = 'running';
+      session.updatedAt = nowMs;
+      return true;
+    });
+  }
+
+  public async abandon(sessionId: string, nowMs: number = Date.now()): Promise<boolean> {
+    const current: ExecutionSession | undefined = this.getSessionById(sessionId);
+    if (!current || current.status === 'completed' || current.status === 'abandoned') {
+      return false;
+    }
+    return this.mutateSession(sessionId, (session) => {
+      if (!this.isActive(session)) {
+        return false;
+      }
+      if (session.status === 'running') {
+        this.settleRunningStep(session, nowMs);
+      }
+      session.status = 'abandoned';
+      session.completedAt = nowMs;
+      session.updatedAt = nowMs;
+      return true;
+    });
+  }
+
+  /** Settles only the currently expired step; elapsed background time never consumes later steps. */
+  public async reconcile(sessionId: string, nowMs: number = Date.now()): Promise<void> {
+    const current: ExecutionSession | undefined = this.getSessionById(sessionId);
+    if (!current || current.status !== 'running') {
       return;
     }
-
-    let changed: boolean = false;
-
-    // 兼容旧版本留下的 waiting-next：从当时记录的更新时间自动进入下一步。
-    if (session.status === 'waiting-next') {
-      const nextStartedAt: number = session.updatedAt > 0 ? session.updatedAt : nowMs;
-      this.startFollowingStepOrComplete(session, nextStartedAt);
-      changed = true;
+    const step: ExecutionStepRecord | undefined = current.steps[current.currentStepIndex];
+    if (!step || getStepRemainingMs(step, nowMs) > 0) {
+      return;
     }
-
-    while (session.status === 'running') {
-      const step: ExecutionStepRecord | undefined = session.steps[session.currentStepIndex];
-      if (!step || getStepRemainingMs(step, nowMs) > 0) {
-        break;
+    await this.mutateSession(sessionId, (session) => {
+      if (session.status !== 'running') {
+        return false;
       }
-      const completedAt: number = step.runStartedAt > 0 ?
-        step.runStartedAt + Math.max(0, step.remainingMs) : nowMs;
-      this.finishCurrentStep(session, completedAt, 'completed');
-      this.startFollowingStepOrComplete(session, completedAt);
-      changed = true;
-    }
-
-    if (changed) {
+      const activeStep: ExecutionStepRecord | undefined = session.steps[session.currentStepIndex];
+      if (!activeStep || getStepRemainingMs(activeStep, nowMs) > 0) {
+        return false;
+      }
+      this.finishCurrentStep(session, nowMs, 'completed');
+      if (session.currentStepIndex >= session.steps.length - 1) {
+        session.status = 'completed';
+        session.completedAt = nowMs;
+      } else {
+        session.status = 'waiting-next';
+      }
       session.updatedAt = nowMs;
-      this.commit();
-    }
+      return true;
+    });
   }
 
   public onChange(listener: () => void): void {
@@ -310,21 +314,16 @@ class ExecutionStore {
   }
 
   /** 记录动作已经触发；重复记录同一动作保持幂等。 */
-  public markActionExecuted(sessionId: string, actionId: string): boolean {
-    const session: ExecutionSession | undefined = this.getSessionById(sessionId);
-    if (!session) {
-      return false;
-    }
-    if (!session.executedActionIds) {
-      session.executedActionIds = [];
-    }
-    if (session.executedActionIds.indexOf(actionId) !== -1) {
-      return false;
-    }
-    session.executedActionIds.push(actionId);
-    session.updatedAt = Date.now();
-    this.commit();
-    return true;
+  public async markActionExecuted(sessionId: string, actionId: string): Promise<boolean> {
+    return this.mutateSession(sessionId, (session) => {
+      const executed: string[] = session.executedActionIds || [];
+      if (executed.indexOf(actionId) !== -1) {
+        return false;
+      }
+      session.executedActionIds = [...executed, actionId];
+      session.updatedAt = Date.now();
+      return true;
+    });
   }
 
   public offChange(listener: () => void): void {
@@ -332,6 +331,24 @@ class ExecutionStore {
     if (index !== -1) {
       this.listeners.splice(index, 1);
     }
+  }
+
+  private async mutateSession(sessionId: string, change: SessionChange): Promise<boolean> {
+    let changed: boolean = false;
+    await appStore.mutate((draft) => {
+      const session: ExecutionSession | undefined = draft.sessions.find((candidate) => candidate.id === sessionId) as ExecutionSession | undefined;
+      if (session) {
+        changed = change(session);
+      }
+    });
+    if (changed) {
+      this.notifyChange();
+    }
+    return changed;
+  }
+
+  private isActive(session: ExecutionSession): boolean {
+    return session.status === 'running' || session.status === 'paused' || session.status === 'waiting-next';
   }
 
   private settleRunningStep(session: ExecutionSession, nowMs: number): void {
@@ -360,6 +377,7 @@ class ExecutionStore {
     if (nextIndex >= session.steps.length) {
       session.status = 'completed';
       session.completedAt = nowMs;
+      session.updatedAt = nowMs;
       return;
     }
     session.currentStepIndex = nextIndex;
@@ -367,15 +385,17 @@ class ExecutionStore {
     next.status = 'running';
     next.runStartedAt = nowMs;
     session.status = 'running';
+    session.updatedAt = nowMs;
   }
 
-  private commit(): void {
-    const payload: ExecutionStorePayload = {
-      schemaVersion: EXECUTION_SCHEMA_VERSION,
-      sessions: this.sessions
-    };
-    persistence.writeString(EXECUTION_SESSIONS_KEY, JSON.stringify(payload));
-    this.listeners.forEach((listener: () => void) => listener());
+  private notifyChange(): void {
+    for (const listener of this.listeners) {
+      try {
+        listener();
+      } catch (_error) {
+        // Keep a failing subscriber from affecting the saved session.
+      }
+    }
   }
 }
 

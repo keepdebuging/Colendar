@@ -14,14 +14,11 @@ export function copyTaskActions(actions: TaskAction[] | undefined): TaskAction[]
   if (!actions) {
     return [];
   }
-  return actions.map((action: TaskAction): TaskAction => {
-    const copied: TaskAction = {
-      id: action.id,
-      trigger: action.trigger,
-      type: action.type,
-      target: action.target,
-      enabled: action.enabled
-    };
-    return copied;
-  });
+  return actions.map((action: TaskAction): TaskAction => ({
+    id: action.id,
+    trigger: action.trigger,
+    type: action.type,
+    target: action.target,
+    enabled: action.enabled
+  }));
 }

@@ -1,6 +1,7 @@
 import { promptAction, router, window } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { ExecutionSession, ExecutionStepRecord, executionStore, getStepRemainingMs } from '../models/ExecutionSession';
+import { reportError } from '../diagnostics/AppLogger';
 import { ActionRunResult, runTaskActions } from '../utils/TaskActionExecutor';
 
 @Entry
@@ -20,19 +21,14 @@ struct ExecutionPage {
   private preparationDelayTimer: number = -1;
   private preparationTimer: number = -1;
   private sessionId: string = '';
+  private reconciling: boolean = false;
 
   aboutToAppear(): void {
     const params: Record<string, string> = router.getParams() as Record<string, string>;
     this.sessionId = params.sessionId || '';
-    executionStore.reconcile(this.sessionId, this.nowMs);
-    this.refreshSession();
-    if (params.prepare === 'true' && this.session && this.session.status === 'running') {
-      this.preparing = executionStore.prepareNewSession(this.session.id);
-      this.refreshSession();
-    }
-    if (!this.preparing) {
-      this.runCurrentActions();
-    }
+    const prepare: boolean = params.prepare === 'true';
+    this.preparing = prepare;
+    void this.initializeSession(prepare);
     this.setLandscape(true);
     this.tickTimer = setInterval(() => {
       this.nowMs = Date.now();
@@ -46,10 +42,38 @@ struct ExecutionPage {
         }
       });
     }, 80);
-    if (this.preparing) {
-      this.preparationDelayTimer = setTimeout(() => {
-        this.startPreparationCountdown();
-      }, 650);
+  }
+
+  private async initializeSession(prepare: boolean): Promise<void> {
+    try {
+      await executionStore.reconcile(this.sessionId, Date.now());
+      this.refreshSession();
+      if (prepare) {
+        await this.prepareNewSession();
+      } else {
+        this.runCurrentActions();
+      }
+    } catch (_error) {
+      this.refreshSession();
+      this.preparing = false;
+      promptAction.showToast({ message: '恢复任务失败，已保留原执行记录' });
+    }
+  }
+
+  private async prepareNewSession(): Promise<void> {
+    if (!this.session || this.session.status !== 'running') {
+      this.preparing = false;
+      return;
+    }
+    try {
+      this.preparing = await executionStore.prepareNewSession(this.session.id);
+      this.refreshSession();
+      if (this.preparing) {
+        this.preparationDelayTimer = setTimeout(() => this.startPreparationCountdown(), 650);
+      }
+    } catch (_error) {
+      this.preparing = false;
+      promptAction.showToast({ message: '无法保存准备状态，请重试' });
     }
   }
 
@@ -84,26 +108,42 @@ struct ExecutionPage {
       this.preparationTimer = -1;
       this.countdownVisible = false;
       if (this.session) {
-        executionStore.resume(this.session.id);
-        this.refreshSession();
-        this.runCurrentActions();
+        void this.resumeAfterPreparation(this.session.id);
+      } else {
+        this.preparing = false;
       }
+    }, 1000);
+  }
+
+  private async resumeAfterPreparation(sessionId: string): Promise<void> {
+    try {
+      await executionStore.resume(sessionId);
+      this.refreshSession();
+      this.runCurrentActions();
       this.preparing = false;
       animateTo({ duration: 420, curve: Curve.EaseInOut }, () => {
         this.presentationReady = true;
       });
-    }, 1000);
+    } catch (_error) {
+      this.preparing = false;
+      promptAction.showToast({ message: '无法继续执行，请检查保存状态' });
+    }
   }
 
   private setLandscape(landscape: boolean): void {
-    const context: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    window.getLastWindow(context).then((lastWindow: window.Window) => {
-      lastWindow.setPreferredOrientation(
-        landscape ? window.Orientation.LANDSCAPE : window.Orientation.PORTRAIT
-      ).catch(() => {});
-      // 组件级安全区扩展无法改变窗口本身的可用布局范围；执行页进入沉浸式布局。
-      lastWindow.setWindowLayoutFullScreen(landscape).catch(() => {});
-    }).catch(() => {});
+    try {
+      const context: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      window.getLastWindow(context).then((lastWindow: window.Window) => {
+        lastWindow.setPreferredOrientation(
+          landscape ? window.Orientation.LANDSCAPE : window.Orientation.PORTRAIT
+        ).catch((_error: Error) => reportError('execution.orientation', 'WINDOW_ORIENTATION_FAILED'));
+        // 组件级安全区扩展无法改变窗口本身的可用布局范围；执行页进入沉浸式布局。
+        lastWindow.setWindowLayoutFullScreen(landscape)
+          .catch((_error: Error) => reportError('execution.layout', 'WINDOW_FULLSCREEN_FAILED'));
+      }).catch((_error: Error) => reportError('execution.window', 'GET_LAST_WINDOW_FAILED'));
+    } catch (_error) {
+      reportError('execution.window', 'GET_LAST_WINDOW_FAILED');
+    }
   }
 
   private refreshSession(): void {
@@ -117,10 +157,24 @@ struct ExecutionPage {
     }
     const step: ExecutionStepRecord | undefined = this.session.steps[this.session.currentStepIndex];
     if (step && getStepRemainingMs(step, this.nowMs) === 0) {
-      executionStore.reconcile(this.session.id, this.nowMs);
+      void this.completeExpiredStep(this.session.id, this.nowMs);
+    }
+  }
+
+  private async completeExpiredStep(sessionId: string, nowMs: number): Promise<void> {
+    if (this.reconciling) {
+      return;
+    }
+    this.reconciling = true;
+    try {
+      await executionStore.completeCurrentStep(sessionId, nowMs);
       this.refreshSession();
       this.runCurrentActions();
       this.leaveIfFinished();
+    } catch (_error) {
+      promptAction.showToast({ message: '步骤状态保存失败，当前任务已保留' });
+    } finally {
+      this.reconciling = false;
     }
   }
 
@@ -136,9 +190,11 @@ struct ExecutionPage {
     const context: common.UIAbilityContext =
       this.getUIContext().getHostContext() as common.UIAbilityContext;
     runTaskActions(context, this.session, 'session-start', this.session.currentStepIndex)
-      .then((results: ActionRunResult[]) => { this.showActionFailures(results); });
+      .then((results: ActionRunResult[]) => { this.showActionFailures(results); })
+      .catch((_error: Error) => { promptAction.showToast({ message: '关联动作状态保存失败，任务仍在继续' }); });
     runTaskActions(context, this.session, 'step-start', this.session.currentStepIndex)
-      .then((results: ActionRunResult[]) => { this.showActionFailures(results); });
+      .then((results: ActionRunResult[]) => { this.showActionFailures(results); })
+      .catch((_error: Error) => { promptAction.showToast({ message: '关联动作状态保存失败，任务仍在继续' }); });
   }
 
   private showActionFailures(results: ActionRunResult[]): void {
@@ -180,15 +236,8 @@ struct ExecutionPage {
       return;
     }
     if (this.confirmedDirection === direction) {
-      if (direction === 'next') {
-        executionStore.skipCurrentStep(this.session.id);
-      } else {
-        executionStore.restartPreviousStep(this.session.id);
-      }
       this.confirmedDirection = '';
-      this.refreshSession();
-      this.runCurrentActions();
-      this.leaveIfFinished();
+      void this.applyStepAction(this.session.id, direction);
       return;
     }
     this.confirmedDirection = direction;
@@ -202,27 +251,69 @@ struct ExecutionPage {
     this.confirmTimer = setTimeout(() => { this.confirmedDirection = ''; }, 2200);
   }
 
+  private async applyStepAction(sessionId: string, direction: string): Promise<void> {
+    try {
+      if (direction === 'next') {
+        await executionStore.skipCurrentStep(sessionId);
+      } else {
+        await executionStore.restartPreviousStep(sessionId);
+      }
+      this.refreshSession();
+      this.runCurrentActions();
+      this.leaveIfFinished();
+    } catch (_error) {
+      promptAction.showToast({ message: '步骤状态保存失败' });
+    }
+  }
+
   private togglePause(): void {
     if (!this.session) {
       return;
     }
-    if (this.session.status === 'running') {
-      executionStore.pause(this.session.id);
-      promptAction.showToast({ message: '倒计时已暂停', duration: 1800 });
-    } else if (this.session.status === 'paused') {
-      executionStore.resume(this.session.id);
+    void this.togglePauseAsync(this.session.id, this.session.status);
+  }
+
+  private async startNextStep(sessionId: string): Promise<void> {
+    try {
+      await executionStore.startNextStep(sessionId);
+      this.refreshSession();
+      this.runCurrentActions();
       promptAction.showToast({ message: '倒计时已开始', duration: 1800 });
+    } catch (_error) {
+      promptAction.showToast({ message: '保存失败，任务仍保留在当前步骤' });
     }
-    this.refreshSession();
-    this.runCurrentActions();
+  }
+
+  private async togglePauseAsync(sessionId: string, status: string): Promise<void> {
+    try {
+      if (status === 'running') {
+        await executionStore.pause(sessionId);
+        promptAction.showToast({ message: '倒计时已暂停', duration: 1800 });
+      } else if (status === 'paused') {
+        await executionStore.resume(sessionId);
+        promptAction.showToast({ message: '倒计时已开始', duration: 1800 });
+      }
+      this.refreshSession();
+      this.runCurrentActions();
+    } catch (_error) {
+      promptAction.showToast({ message: '保存失败，任务状态未更改' });
+    }
   }
 
   private finishTask(): void {
     if (!this.session) {
       return;
     }
-    executionStore.abandon(this.session.id);
-    router.back();
+    void this.finishTaskAsync(this.session.id);
+  }
+
+  private async finishTaskAsync(sessionId: string): Promise<void> {
+    try {
+      await executionStore.abandon(sessionId);
+      router.back();
+    } catch (_error) {
+      promptAction.showToast({ message: '结束任务失败，原任务已保留' });
+    }
   }
 
   private leaveIfFinished(): void {
@@ -338,10 +429,7 @@ struct ExecutionPage {
               Button('开始下一步')
                 .id('execution-start-next')
                 .onClick(() => {
-                  executionStore.startNextStep(this.session!.id);
-                  this.refreshSession();
-                  this.runCurrentActions();
-                  promptAction.showToast({ message: '倒计时已开始', duration: 1800 });
+                  void this.startNextStep(this.session!.id);
                 })
             } else {
               Button(this.session.status === 'paused' ? '继续' : '暂停')
@@ -423,3 +511,4 @@ struct ExecutionPage {
     .id('execution-page')
   }
 }
+

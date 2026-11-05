@@ -10,12 +10,13 @@
  * 4. 空状态提示
  */
 
+import { pasteboard } from '@kit.BasicServicesKit';
 import { promptAction, router } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { systemShare } from '@kit.ShareKit';
-import { TaskPackage, taskStore } from '../models/TaskPackage';
+import { TaskPackage, taskStore, generateId } from '../models/TaskPackage';
 import { PackageDetailDialog } from './PackageDetailDialog';
 import { ImportPackageDialog } from './ImportPackageDialog';
 import {
@@ -23,6 +24,8 @@ import {
   importTaskPackage,
   TaskPackageImportResult
 } from '../utils/TaskPackageTransfer';
+import { DEFAULT_PACKAGES } from '../onboarding/DefaultPackages';
+import { buildDiagnosticReport } from '../diagnostics/DiagnosticReport';
 
 /**
  * 注意：这里使用 @Component 而不是 @Entry，
@@ -38,6 +41,7 @@ export struct TaskPackageTab {
    */
   @Consume @Watch('loadData') refreshTrigger: number = 0;
   @State packages: TaskPackage[] = [];
+  @State private importingExamples: boolean = false;
 
   /**
    * 从全局仓库同步数据
@@ -54,23 +58,11 @@ export struct TaskPackageTab {
     this.loadData();
   }
 
-  showImportDialog(): void {
+  private showImportDialog(): void {
     const dialogController: CustomDialogController = new CustomDialogController({
       builder: ImportPackageDialog({
-        onClose: () => {
-          dialogController.close();
-        },
-        onImport: (text: string) => {
-          const result: TaskPackageImportResult = importTaskPackage(text, taskStore.packages.length);
-          if (!result.package) {
-            promptAction.showToast({ message: result.error, duration: 2200 });
-            return;
-          }
-          taskStore.addPackage(result.package);
-          this.loadData();
-          dialogController.close();
-          promptAction.showToast({ message: '任务包已导入，关联动作默认关闭', duration: 2200 });
-        }
+        onClose: () => dialogController.close(),
+        onImport: (text: string) => { void this.importPackageText(text, dialogController); }
       }),
       autoCancel: true,
       alignment: DialogAlignment.Center,
@@ -80,7 +72,23 @@ export struct TaskPackageTab {
     dialogController.open();
   }
 
-  sharePackage(pkg: TaskPackage): void {
+  private async importPackageText(text: string, dialogController: CustomDialogController): Promise<void> {
+    const result: TaskPackageImportResult = importTaskPackage(text, taskStore.packages.length);
+    if (!result.package) {
+      promptAction.showToast({ message: result.error, duration: 2200 });
+      return;
+    }
+    try {
+      await taskStore.addPackage(result.package);
+      this.loadData();
+      dialogController.close();
+      promptAction.showToast({ message: '任务包已导入，关联动作默认关闭', duration: 2200 });
+    } catch (_error) {
+      promptAction.showToast({ message: '导入失败，现有数据保持不变', duration: 2200 });
+    }
+  }
+
+  private sharePackage(pkg: TaskPackage): void {
     const sharedData: systemShare.SharedData = new systemShare.SharedData({
       utd: utd.UniformDataType.PLAIN_TEXT,
       title: `${pkg.name} · Colendar 任务包`,
@@ -95,6 +103,41 @@ export struct TaskPackageTab {
     }).catch((error: BusinessError) => {
       promptAction.showToast({ message: `导出失败：${error.message}`, duration: 2200 });
     });
+  }
+
+  private async importExamples(): Promise<void> {
+    if (this.importingExamples) {
+      return;
+    }
+    this.importingExamples = true;
+    try {
+      const examples: TaskPackage[] = DEFAULT_PACKAGES.map((preset) => ({
+        id: generateId(),
+        name: preset.name,
+        color: preset.color,
+        _version: 0,
+        steps: preset.steps.map((step) => ({ name: step.name, duration: step.duration }))
+      }));
+      await taskStore.addPackages(examples);
+      this.loadData();
+      promptAction.showToast({ message: '示例已添加。打开日历即可安排到合适的时间。', duration: 2500 });
+    } catch (_error) {
+      promptAction.showToast({ message: '导入示例失败，现有数据保持不变' });
+    } finally {
+      this.importingExamples = false;
+    }
+  }
+
+  private copyDiagnostics(): void {
+    try {
+      const report: string = buildDiagnosticReport('TaskPackageTab');
+      pasteboard.getSystemPasteboard().setDataSync(
+        pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, report)
+      );
+      promptAction.showToast({ message: '诊断信息已复制；报告不含任务名称或步骤内容' });
+    } catch (_error) {
+      promptAction.showToast({ message: '复制诊断信息失败' });
+    }
   }
 
   /**
@@ -204,26 +247,21 @@ export struct TaskPackageTab {
       Column() {
         // ---- 标题栏 ----
         Row() {
-          Blank()
           Text('我的任务包')
             .fontSize(24)
             .fontWeight(FontWeight.Bold)
             .layoutWeight(1)
-            .textAlign(TextAlign.Center)
-
           Button('导入')
-            .fontSize(13)
-            .height(32)
-            .borderRadius(16)
-            .fontColor('#007AFF')
-            .backgroundColor('#EAF3FF')
-            .padding({ left: 14, right: 14 })
-            .onClick(() => {
-              this.showImportDialog();
-            })
+            .fontSize(12)
+            .onClick(() => this.showImportDialog())
+          Button('复制诊断信息')
+            .fontSize(12)
+            .onClick(() => this.copyDiagnostics())
         }
         .width('100%')
-        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+        .padding({ left: 16, right: 12, top: 12, bottom: 12 })
+        .justifyContent(FlexAlign.SpaceBetween)
+        .alignItems(VerticalAlign.Center)
         .backgroundColor('#F5F5F5')
 
         // ---- 内容区域 ----
@@ -236,6 +274,17 @@ export struct TaskPackageTab {
               .fontColor('#999999')
               .textAlign(TextAlign.Center)
               .padding(20)
+            Text('先创建任务包，再安排到日历，最后开始执行。')
+              .fontSize(14)
+              .fontColor('#777777')
+              .textAlign(TextAlign.Center)
+              .padding({ left: 24, right: 24, bottom: 16 })
+            Button('创建自己的任务包')
+              .onClick(() => router.pushUrl({ url: 'pages/CreatePackage' }))
+              .margin({ bottom: 10 })
+            Button('使用示例任务包')
+              .enabled(!this.importingExamples)
+              .onClick(() => { void this.importExamples(); })
             Blank()
           }
           .width('100%')
@@ -353,3 +402,4 @@ export struct TaskPackageTab {
     .backgroundColor('#F0F0F0')
   }
 }
+

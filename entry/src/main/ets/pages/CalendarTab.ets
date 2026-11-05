@@ -19,84 +19,46 @@
 import { promptAction, router } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { uniformTypeDescriptor as utd } from '@kit.ArkData';
-import { BusinessError } from '@kit.BasicServicesKit';
+import { BusinessError, pasteboard } from '@kit.BasicServicesKit';
 import { systemShare } from '@kit.ShareKit';
 import { i18n } from '@kit.LocalizationKit';
 import { TaskPackage, taskStore, TaskStep } from '../models/TaskPackage';
 import { ScheduledEvent, scheduleStore, getTotalDuration } from '../models/ScheduledEvent';
 import { ExecutionSession, executionStore } from '../models/ExecutionSession';
 import { generateId } from '../models/TaskPackage';
+import { validateDate, validateInterval, validateSteps } from '../domain/Validation';
+import { cloneScheduledEvent as cloneScheduledEventCopy } from '../domain/EventCopies';
+import { copyTaskActions } from '../models/TaskAction';
 import { PackageDetailDialog } from './PackageDetailDialog';
 import { ScheduledEventDetailDialog } from './ScheduledEventDetailDialog';
 import { UpcomingTaskDialog } from './UpcomingTaskDialog';
-import { copyTaskActions } from '../models/TaskAction';
+import { buildDiagnosticReport } from '../diagnostics/DiagnosticReport';
 import {
-  durationMinutesToHeight,
-  resolveTimelinePlacement,
+  CalendarCell,
+  WeekDayInfo,
+  buildMonthCells,
+  buildWeekDays,
+  formatDateDisplay as formatDateDisplayUtil,
+  formatDateStr as formatDateStrUtil,
+  getMondayOf as getMondayOfUtil
+} from '../calendar/CalendarDateUtils';
+import { DayEventLayout, WeekEventGroup, buildDayEventLayouts, buildWeekEventGroups } from '../calendar/TimelineLayout';
+import {
+  TimeResult,
   TimelinePlacement,
-  timelineMinutesToY
-} from '../utils/TimelineGeometry';
+  eventBlockHeight as getEventBlockHeight,
+  eventBlockTop as getEventBlockTop,
+  resolveTimelinePlacement,
+  snapTimeFromY as snapTimeFromYUtil
+} from '../calendar/TimelineGeometry';
 
 // ==================== 接口定义 ====================
-
-/** 日历网格中每个格子的数据（月视图） */
-interface CalendarCell {
-  /** 日期数字（1-31，或上月/下月的实际日期） */
-  date: number;
-  /** 完整日期字符串 "YYYY-MM-DD"，非当月格子也有有效值 */
-  dateStr: string;
-  /** 是否是今天 */
-  isToday: boolean;
-  /** 是否属于当前月份 */
-  isCurrentMonth: boolean;
-}
-
-/** 周视图中每一天的信息 */
-interface WeekDayInfo {
-  /** 完整日期字符串 "YYYY-MM-DD" */
-  dateStr: string;
-  /** 星期几（0=周一, 6=周日） */
-  dayOfWeek: number;
-  /** 日期数字 (1-31) */
-  dayNumber: number;
-  /** 月份数字 (1-12) */
-  monthNumber: number;
-  /** 是否是今天 */
-  isToday: boolean;
-  /** 星期名称缩写 */
-  dayName: string;
-}
-
-/** 时间吸附结果 */
-interface TimeResult {
-  /** 小时 (0-23) */
-  hour: number;
-  /** 分钟 (0-59) */
-  minute: number;
-}
 
 /** 公历日期对应的干支年、干支月和农历日文本。 */
 interface TraditionalDateInfo {
   year: string;
   month: string;
   day: string;
-}
-
-/** 周视图中的一个显示单元：单个日程，或由两个重叠日程合成的卡片。 */
-interface WeekEventGroup {
-  key: string;
-  first: ScheduledEvent;
-  second?: ScheduledEvent;
-  backgroundEvent: ScheduledEvent;
-  startMinutes: number;
-  endMinutes: number;
-}
-
-/** 日视图事件的横向布局结果。 */
-interface DayEventLayout {
-  event: ScheduledEvent;
-  column: number;
-  isOverlapping: boolean;
 }
 
 // ==================== 布局常量 ====================
@@ -224,6 +186,7 @@ export struct CalendarTab {
   @State private transferPreviewStartMinutes: number = -1;
   @State private transferPreviewDuration: number = 0;
   @State private transferPreviewColor: string = '#007AFF';
+  @State private transferSaving: boolean = false;
   /** 当前进入拉伸模式的日程 ID */
   @State private stretchEventId: string = '';
   /** 由自定义长按手势控制显示的日程菜单 ID */
@@ -609,8 +572,14 @@ export struct CalendarTab {
     dialogController.open();
   }
 
-  private startScheduledEventFromReminder(evt: ScheduledEvent): void {
-    const session: ExecutionSession | undefined = executionStore.startFromScheduledEvent(evt);
+  private async startScheduledEventFromReminder(evt: ScheduledEvent): Promise<void> {
+    let session: ExecutionSession | undefined;
+    try {
+      session = await executionStore.startFromScheduledEvent(evt);
+    } catch (_error) {
+      promptAction.showToast({ message: '无法开始任务，请检查日程数据' });
+      return;
+    }
     if (!session) {
       promptAction.showToast({ message: '请先结束或继续当前正在执行的任务', duration: 2200 });
       return;
@@ -670,23 +639,14 @@ export struct CalendarTab {
    * 将日期格式化为 "YYYY-MM-DD" 字符串
    */
   formatDateStr(year: number, month: number, day: number): string {
-    const m: string = (month + 1).toString().padStart(2, '0');
-    const d: string = day.toString().padStart(2, '0');
-    return `${year}-${m}-${d}`;
+    return formatDateStrUtil(year, month, day);
   }
 
   /**
    * 格式化日期为人类可读形式："YYYY年M月D日"
    */
   formatDateDisplay(dateStr: string): string {
-    if (!dateStr) {
-      return '';
-    }
-    const parts: string[] = dateStr.split('-');
-    if (parts.length !== 3) {
-      return dateStr;
-    }
-    return `${parseInt(parts[0])}年${parseInt(parts[1])}月${parseInt(parts[2])}日`;
+    return formatDateDisplayUtil(dateStr);
   }
 
   /**
@@ -706,79 +666,7 @@ export struct CalendarTab {
     const todayStr: string = this.formatDateStr(
       today.getFullYear(), today.getMonth(), today.getDate()
     );
-
-    // 当月第一天
-    const firstDay: Date = new Date(this.currentYear, this.currentMonth, 1);
-    // getDay(): 0=周日, 1=周一, ..., 6=周六
-    let startDayOfWeek: number = firstDay.getDay();
-    // 转换为周一=0, 周日=6
-    startDayOfWeek = startDayOfWeek === 0 ? 6 : startDayOfWeek - 1;
-
-    // 当月天数
-    const daysInMonth: number = new Date(
-      this.currentYear, this.currentMonth + 1, 0
-    ).getDate();
-
-    // 上月信息（用于计算首部填充格的实际日期）
-    let prevMonth: number = this.currentMonth - 1;
-    let prevYear: number = this.currentYear;
-    if (prevMonth < 0) {
-      prevMonth = 11;
-      prevYear -= 1;
-    }
-    const prevMonthDays: number = new Date(prevYear, prevMonth + 1, 0).getDate();
-
-    // 下月信息（用于计算尾部填充格的实际日期）
-    let nextMonth: number = this.currentMonth + 1;
-    let nextYear: number = this.currentYear;
-    if (nextMonth > 11) {
-      nextMonth = 0;
-      nextYear += 1;
-    }
-
-    // 构建网格（固定 6 行 × 7 列 = 42 格）
-    const cells: CalendarCell[] = [];
-    const totalCells: number = 42;
-
-    for (let i: number = 0; i < totalCells; i++) {
-      const dayNum: number = i - startDayOfWeek + 1; // 从 1 开始
-
-      if (dayNum >= 1 && dayNum <= daysInMonth) {
-        // ===== 当月日期 =====
-        const dateStr: string = this.formatDateStr(
-          this.currentYear, this.currentMonth, dayNum
-        );
-        cells.push({
-          date: dayNum,
-          dateStr: dateStr,
-          isToday: dateStr === todayStr,
-          isCurrentMonth: true
-        });
-      } else if (dayNum < 1) {
-        // ===== 上月末尾填充格（Week 4 改进：显示实际日期） =====
-        // dayNum 为 0, -1, -2... 表示上月倒数第1、第2、第3...天
-        const prevDay: number = prevMonthDays + dayNum;
-        const dateStr: string = this.formatDateStr(prevYear, prevMonth, prevDay);
-        cells.push({
-          date: prevDay,
-          dateStr: dateStr,
-          isToday: dateStr === todayStr,
-          isCurrentMonth: false
-        });
-      } else {
-        // ===== 下月开头填充格（Week 4 改进：显示实际日期） =====
-        const nextDay: number = dayNum - daysInMonth;
-        const dateStr: string = this.formatDateStr(nextYear, nextMonth, nextDay);
-        cells.push({
-          date: nextDay,
-          dateStr: dateStr,
-          isToday: dateStr === todayStr,
-          isCurrentMonth: false
-        });
-      }
-    }
-
-    this.calendarCells = cells;
+    this.calendarCells = buildMonthCells(this.currentYear, this.currentMonth, todayStr);
   }
 
   /**
@@ -791,26 +679,7 @@ export struct CalendarTab {
     const todayStr: string = this.formatDateStr(
       today.getFullYear(), today.getMonth(), today.getDate()
     );
-    const dayNames: string[] = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
-    const weekDays: WeekDayInfo[] = [];
-
-    for (let i: number = 0; i < 7; i++) {
-      const day: Date = new Date(this.currentWeekStart);
-      day.setDate(day.getDate() + i);
-      const dateStr: string = this.formatDateStr(
-        day.getFullYear(), day.getMonth(), day.getDate()
-      );
-      weekDays.push({
-        dateStr: dateStr,
-        dayOfWeek: i, // 0=周一
-        dayNumber: day.getDate(),
-        monthNumber: day.getMonth() + 1,
-        isToday: dateStr === todayStr,
-        dayName: dayNames[i]
-      });
-    }
-
-    this.weekDays = weekDays;
+    this.weekDays = buildWeekDays(this.currentWeekStart, todayStr);
   }
 
   // ==================== 视图切换（Week 4 新增） ====================
@@ -1078,91 +947,12 @@ export struct CalendarTab {
 
   /** 周视图把互相重叠的两个日程整理成一个显示单元。 */
   private getWeekEventGroups(dateStr: string): WeekEventGroup[] {
-    const sorted: ScheduledEvent[] = [...this.getEventsForDate(dateStr)];
-    sorted.sort((first: ScheduledEvent, second: ScheduledEvent): number => {
-      const startDiff: number = this.eventStartMinutes(first) - this.eventStartMinutes(second);
-      if (startDiff !== 0) {
-        return startDiff;
-      }
-      return this.eventEndMinutes(second) - this.eventEndMinutes(first);
-    });
-
-    const usedIds: Set<string> = new Set<string>();
-    const groups: WeekEventGroup[] = [];
-    for (let firstIndex: number = 0; firstIndex < sorted.length; firstIndex++) {
-      const first: ScheduledEvent = sorted[firstIndex];
-      if (usedIds.has(first.id)) {
-        continue;
-      }
-
-      let second: ScheduledEvent | undefined = undefined;
-      for (let secondIndex: number = firstIndex + 1; secondIndex < sorted.length; secondIndex++) {
-        const candidate: ScheduledEvent = sorted[secondIndex];
-        if (!usedIds.has(candidate.id) && this.eventsOverlap(first, candidate)) {
-          second = candidate;
-          break;
-        }
-      }
-
-      usedIds.add(first.id);
-      if (second === undefined) {
-        groups.push({
-          key: first.id,
-          first: first,
-          backgroundEvent: first,
-          startMinutes: this.eventStartMinutes(first),
-          endMinutes: this.eventEndMinutes(first)
-        });
-        continue;
-      }
-
-      usedIds.add(second.id);
-      const firstDuration: number = getTotalDuration(first.steps);
-      const secondDuration: number = getTotalDuration(second.steps);
-      groups.push({
-        key: `${first.id}-${second.id}`,
-        first: first,
-        second: second,
-        backgroundEvent: firstDuration >= secondDuration ? first : second,
-        startMinutes: Math.min(this.eventStartMinutes(first), this.eventStartMinutes(second)),
-        endMinutes: Math.max(this.eventEndMinutes(first), this.eventEndMinutes(second))
-      });
-    }
-    return groups;
+    return buildWeekEventGroups(this.getEventsForDate(dateStr));
   }
 
   /** 日视图为重叠日程分配左右两列，未重叠日程继续占满可用宽度。 */
   private getDayEventLayouts(dateStr: string): DayEventLayout[] {
-    const sorted: ScheduledEvent[] = [...this.getEventsForDate(dateStr)];
-    sorted.sort((first: ScheduledEvent, second: ScheduledEvent): number => {
-      const startDiff: number = this.eventStartMinutes(first) - this.eventStartMinutes(second);
-      if (startDiff !== 0) {
-        return startDiff;
-      }
-      return this.eventEndMinutes(second) - this.eventEndMinutes(first);
-    });
-
-    const columnEnds: number[] = [-1, -1];
-    const result: DayEventLayout[] = [];
-    for (let index: number = 0; index < sorted.length; index++) {
-      const evt: ScheduledEvent = sorted[index];
-      const startMinutes: number = this.eventStartMinutes(evt);
-      let isOverlapping: boolean = false;
-      for (let otherIndex: number = 0; otherIndex < sorted.length; otherIndex++) {
-        if (otherIndex !== index && this.eventsOverlap(evt, sorted[otherIndex])) {
-          isOverlapping = true;
-          break;
-        }
-      }
-
-      let column: number = 0;
-      if (isOverlapping && startMinutes < columnEnds[0]) {
-        column = 1;
-      }
-      columnEnds[column] = this.eventEndMinutes(evt);
-      result.push({ event: evt, column: column, isOverlapping: isOverlapping });
-    }
-    return result;
+    return buildDayEventLayouts(this.getEventsForDate(dateStr));
   }
 
   // ==================== 拖拽处理 ====================
@@ -1283,7 +1073,7 @@ export struct CalendarTab {
    * @param startHour   开始小时 (0-23)，可选
    * @param startMinute 开始分钟 (0/30)，可选
    */
-  handleDrop(dateStr: string, pkgId: string, startHour?: number, startMinute?: number): void {
+  async handleDrop(dateStr: string, pkgId: string, startHour?: number, startMinute?: number): Promise<void> {
     if (!dateStr || !pkgId) {
       this.finishPackageDrag();
       return;
@@ -1297,6 +1087,16 @@ export struct CalendarTab {
       return;
     }
 
+    const dateError: string = validateDate(dateStr);
+    const stepsError: string = validateSteps(pkg.steps);
+    if (dateError !== '' || stepsError !== '') {
+      this.finishPackageDrag();
+      promptAction.showToast({ message: dateError || stepsError, duration: 2200 });
+      return;
+    }
+
+    let targetDate: string = dateStr;
+
     // ---- 计算开始时间 ----
     let sHour: number;
     let sMin: number;
@@ -1307,8 +1107,16 @@ export struct CalendarTab {
     } else {
       // 月视图：默认安排到当前时间 1 分钟后，方便快速验证应用内提醒。
       const now: Date = new Date();
-      const defaultStartMinutes: number =
-        (now.getHours() * 60 + now.getMinutes() + 1) % (24 * 60);
+      let defaultStartMinutes: number = now.getHours() * 60 + now.getMinutes() + 1;
+      if (defaultStartMinutes >= 24 * 60) {
+        const nextDate: Date = new Date(
+          Number(dateStr.slice(0, 4)),
+          Number(dateStr.slice(5, 7)) - 1,
+          Number(dateStr.slice(8, 10)) + 1
+        );
+        targetDate = this.formatDateStr(nextDate.getFullYear(), nextDate.getMonth(), nextDate.getDate());
+        defaultStartMinutes = 0;
+      }
       sHour = Math.floor(defaultStartMinutes / 60);
       sMin = defaultStartMinutes % 60;
     }
@@ -1316,7 +1124,13 @@ export struct CalendarTab {
     // ---- 计算结束时间（开始时间 + 任务包总时长） ----
     const totalMin: number = getTotalDuration(pkg.steps);
     const startTotalMin: number = sHour * 60 + sMin;
-    if (!this.canPlaceScheduledInterval(dateStr, startTotalMin, totalMin)) {
+    const intervalError: string = validateInterval(startTotalMin, totalMin);
+    if (intervalError !== '') {
+      this.finishPackageDrag();
+      promptAction.showToast({ message: intervalError, duration: 2200 });
+      return;
+    }
+    if (!this.canPlaceScheduledInterval(targetDate, startTotalMin, totalMin)) {
       this.finishPackageDrag();
       promptAction.showToast({
         message: '该时段已有两个任务包，不能继续安排',
@@ -1325,13 +1139,13 @@ export struct CalendarTab {
       return;
     }
     const endTotalMin: number = startTotalMin + totalMin;
-    const eHour: number = Math.floor(endTotalMin / 60) % 24;
+    const eHour: number = Math.floor(endTotalMin / 60);
     const eMin: number = endTotalMin % 60;
 
     // ---- 创建日程安排 ----
     const newEvent: ScheduledEvent = {
       id: generateId(),
-      date: dateStr,
+      date: targetDate,
       packageId: pkg.id,
       packageName: pkg.name,
       color: pkg.color,
@@ -1342,10 +1156,17 @@ export struct CalendarTab {
       steps: pkg.steps.map((s: TaskStep): TaskStep => ({ name: s.name, duration: s.duration })),
       reminderEnabled: true,
       isCustomized: false,
+      sourcePackageVersion: pkg._version,
       actions: copyTaskActions(pkg.actions)
     };
 
-    scheduleStore.addEvent(newEvent);
+    try {
+      await scheduleStore.addEvent(newEvent);
+    } catch (_error) {
+      this.finishPackageDrag();
+      promptAction.showToast({ message: '安排失败，日程数据未更改', duration: 2200 });
+      return;
+    }
 
     // 刷新本地数据与日期集合
     this.schedules = [...scheduleStore.events];
@@ -1353,8 +1174,8 @@ export struct CalendarTab {
     this.buildCalendar();
 
     // ---- 选中该日期并显示给用户 ----
-    this.selectedDateStr = dateStr;
-    this.selectedDateDisplay = this.formatDateDisplay(dateStr);
+    this.selectedDateStr = targetDate;
+    this.selectedDateDisplay = this.formatDateDisplay(targetDate);
     this.finishPackageDrag();
 
     const timeLabel: string = `${sHour.toString().padStart(2, '0')}:${sMin.toString().padStart(2, '0')}`;
@@ -1379,23 +1200,25 @@ export struct CalendarTab {
     let pkgId: string = this.activeDragPkgId;
 
     if (pkgId) {
-      this.handleDrop(dateStr, pkgId);
+      void this.handleDrop(dateStr, pkgId);
       this.activeDragPkgId = '';
     }
   }
 
   // ==================== 周/日视图拖拽 + 吸附 + 预览 ====================
 
-  /** 使用共享几何规则计算五分钟粒度，并仅在阈值内吸附整点/半点。 */
+  /**
+   * 根据手指 Y 坐标和滚动偏移量，计算对应时间并吸附到最近的半小时。
+   *
+   * @param y            事件相对于目标组件的 Y 坐标
+   * @param scrollOffset 当前 Scroll 的垂直滚动偏移量
+   * @param hourHeight   每小时对应的高度（vp），周视图 42 / 日视图 60
+   * @returns {hour, minute} 吸附后的时间
+   */
   private snapTimeFromY(
-    y: number, scrollOffset: number, hourHeight: number, durationMinutes: number
+    y: number, scrollOffset: number, hourHeight: number, durationMinutes: number = 1
   ): TimeResult {
-    const placement: TimelinePlacement = resolveTimelinePlacement(
-      y, scrollOffset, hourHeight, 0, GRID_LINE_OFFSET, durationMinutes, 8
-    );
-    this.dragPreviewSnapped = placement.snappedToMarker;
-    const result: TimeResult = { hour: placement.hour, minute: placement.minute };
-    return result;
+    return snapTimeFromYUtil(y, scrollOffset, hourHeight, GRID_LINE_OFFSET, durationMinutes);
   }
 
   /** 把 DragEvent 的窗口坐标换算为时间轴可视区域内坐标。 */
@@ -1420,8 +1243,7 @@ export struct CalendarTab {
       return;
     }
     const y: number = this.dragLocalY(event, timelineWindowY);
-    const snapped: TimeResult =
-      this.snapTimeFromY(y, scrollOffset, hourHeight, this.dragPkgTotalMin);
+    const snapped: TimeResult = this.snapTimeFromY(y, scrollOffset, hourHeight, this.dragPkgTotalMin);
 
     // 计算结束时间
     const endTotalMin: number = snapped.hour * 60 + snapped.minute + this.dragPkgTotalMin;
@@ -1454,15 +1276,10 @@ export struct CalendarTab {
       return;
     }
 
-    if (this.dragPreviewVisible && this.dragPreviewHasTime && this.dragPreviewDate === dateStr) {
-      this.handleDrop(dateStr, pkgId, this.dragPreviewHour, this.dragPreviewMinute);
-    } else {
-      const y: number = this.dragLocalY(event, timelineWindowY);
-      const snapped: TimeResult = this.snapTimeFromY(
-        y, scrollOffset, hourHeight, this.dragPkgTotalMin
-      );
-      this.handleDrop(dateStr, pkgId, snapped.hour, snapped.minute);
-    }
+    const y: number = this.dragLocalY(event, timelineWindowY);
+    const snapped: TimeResult = this.snapTimeFromY(y, scrollOffset, hourHeight, this.dragPkgTotalMin);
+
+    void this.handleDrop(dateStr, pkgId, snapped.hour, snapped.minute);
     this.activeDragPkgId = '';
   }
 
@@ -1538,26 +1355,17 @@ export struct CalendarTab {
 
   // ==================== 日程长按菜单与复制/剪切/分享 ====================
 
+  /** Clicking outside the focused event exits focus without changing stored data. */
+  private cancelEventFocus(): void {
+    this.contextMenuEventId = '';
+    this.stretchEventId = '';
+    this.stretchOriginalEvent = null;
+    this.stretchPreviewSteps = [];
+  }
+
   /** 创建日程深拷贝，避免修改日程副本时污染任务包模板或原日程。 */
   private cloneScheduledEvent(evt: ScheduledEvent): ScheduledEvent {
-    return {
-      id: evt.id,
-      date: evt.date,
-      packageId: evt.packageId,
-      packageName: evt.packageName,
-      color: evt.color,
-      startHour: evt.startHour,
-      startMinute: evt.startMinute,
-      endHour: evt.endHour,
-      endMinute: evt.endMinute,
-      reminderEnabled: evt.reminderEnabled,
-      isCustomized: evt.isCustomized,
-      actions: copyTaskActions(evt.actions),
-      steps: evt.steps.map((step: TaskStep): TaskStep => ({
-        name: step.name,
-        duration: step.duration
-      }))
-    };
+    return cloneScheduledEventCopy(evt) as ScheduledEvent;
   }
 
   /** 进入复制或剪切待粘贴状态。 */
@@ -1593,73 +1401,81 @@ export struct CalendarTab {
       this.pendingTransferEvent.id === evt.id;
   }
 
-  /**
-   * 两段式粘贴：第一次点击放置/移动虚线框；第二次点击框内才提交。
-   * 复制生成新 ID，剪切保留原 ID。
-   */
+  /** First click places or moves the preview; a second click inside it commits the copy/move. */
   private handleTransferTargetClick(
     dateStr: string, y: number, hourHeight: number, visibleStartHour: number
   ): void {
-    if (this.pendingTransferEvent === null || this.transferMode === '') {
+    if (this.pendingTransferEvent === null || this.transferMode === '' || this.transferSaving) {
       return;
     }
-    const targetPlacement: TimelinePlacement = resolveTimelinePlacement(
+    const placement: TimelinePlacement = resolveTimelinePlacement(
       y, 0, hourHeight, visibleStartHour * 60, GRID_LINE_OFFSET,
       this.transferPreviewDuration, 8
     );
-    const clickedMinutes: number = targetPlacement.minutes;
+    const clickedMinutes: number = placement.minutes;
     const clickedInsidePreview: boolean = this.transferPreviewDate === dateStr &&
       this.transferPreviewStartMinutes >= 0 &&
       clickedMinutes >= this.transferPreviewStartMinutes &&
       clickedMinutes < this.transferPreviewStartMinutes + this.transferPreviewDuration;
-
     if (clickedInsidePreview) {
-      this.commitTransferredEvent();
+      void this.commitTransferredEvent();
       return;
     }
-
+    const dateError: string = validateDate(dateStr);
     const maxStart: number = Math.max(0, 1440 - this.transferPreviewDuration);
-    const previewStart: number = Math.min(clickedMinutes, maxStart);
+    const previewStart: number = Math.min(placement.minutes, maxStart);
     const excludedEventId: string = this.transferMode === 'cut' ? this.pendingTransferEvent.id : '';
+    if (dateError !== '') {
+      promptAction.showToast({ message: dateError, duration: 2200 });
+      return;
+    }
     if (!this.canPlaceScheduledInterval(
       dateStr, previewStart, this.transferPreviewDuration, excludedEventId
     )) {
-      promptAction.showToast({
-        message: '该时段已有两个任务包，不能继续安排',
-        duration: 2000
-      });
+      promptAction.showToast({ message: '该时段已有两个任务包，不能继续安排', duration: 2000 });
       return;
     }
     this.transferPreviewDate = dateStr;
     this.transferPreviewStartMinutes = previewStart;
   }
 
-  /** 第二次点击预览框后一次性提交复制或剪切。 */
-  private commitTransferredEvent(): void {
-    if (this.pendingTransferEvent === null || this.transferMode === '' ||
+  private async commitTransferredEvent(): Promise<void> {
+    if (this.pendingTransferEvent === null || this.transferMode === '' || this.transferSaving ||
       this.transferPreviewDate === '' || this.transferPreviewStartMinutes < 0) {
       return;
     }
     const pasted: ScheduledEvent = this.cloneScheduledEvent(this.pendingTransferEvent);
     const startTotalMinutes: number = this.transferPreviewStartMinutes;
-    const endTotalMinutes: number = startTotalMinutes + this.transferPreviewDuration;
+    const intervalError: string = validateInterval(startTotalMinutes, this.transferPreviewDuration);
+    if (intervalError !== '') {
+      promptAction.showToast({ message: intervalError, duration: 2200 });
+      return;
+    }
     pasted.date = this.transferPreviewDate;
     pasted.startHour = Math.floor(startTotalMinutes / 60);
     pasted.startMinute = startTotalMinutes % 60;
-    pasted.endHour = Math.floor(endTotalMinutes / 60) % 24;
+    const endTotalMinutes: number = startTotalMinutes + this.transferPreviewDuration;
+    pasted.endHour = Math.floor(endTotalMinutes / 60);
     pasted.endMinute = endTotalMinutes % 60;
     pasted.isCustomized = true;
 
     const actionLabel: string = this.transferMode === 'copy' ? '复制' : '移动';
-    if (this.transferMode === 'copy') {
-      pasted.id = generateId();
-      scheduleStore.addEvent(pasted);
-    } else {
-      scheduleStore.updateEvent(pasted);
+    this.transferSaving = true;
+    try {
+      if (this.transferMode === 'copy') {
+        pasted.id = generateId();
+        await scheduleStore.addEvent(pasted);
+      } else {
+        await scheduleStore.updateEvent(pasted);
+      }
+      this.cancelEventTransfer();
+      this.loadData();
+      promptAction.showToast({ message: `已${actionLabel}到目标时间`, duration: 1800 });
+    } catch (_error) {
+      promptAction.showToast({ message: '日程保存失败，原安排已保留', duration: 2200 });
+    } finally {
+      this.transferSaving = false;
     }
-    this.cancelEventTransfer();
-    this.loadData();
-    promptAction.showToast({ message: `已${actionLabel}到目标时间`, duration: 1800 });
   }
 
   /** 将日程整理为纯文本并拉起 HarmonyOS 系统分享面板。 */
@@ -1737,7 +1553,7 @@ export struct CalendarTab {
   }
 
   /** 拉伸结束：把预览一次性写入 ScheduleStore 并持久化。 */
-  private finishEventStretch(): void {
+  private async finishEventStretch(): Promise<void> {
     if (this.stretchOriginalEvent === null) {
       return;
     }
@@ -1750,8 +1566,17 @@ export struct CalendarTab {
     }));
     updated.isCustomized = true;
     const endTotalMinutes: number = this.stretchPreviewStartMinutes + this.stretchPreviewDuration;
-    updated.endHour = Math.floor(endTotalMinutes / 60) % 24;
+    const intervalError: string = validateInterval(this.stretchPreviewStartMinutes, this.stretchPreviewDuration);
+    if (intervalError !== '') {
+      this.stretchOriginalEvent = null;
+      this.stretchEventId = '';
+      this.loadData();
+      promptAction.showToast({ message: intervalError, duration: 2200 });
+      return;
+    }
+    updated.endHour = Math.floor(endTotalMinutes / 60);
     updated.endMinute = endTotalMinutes % 60;
+    updated.isCustomized = true;
     if (!this.canPlaceScheduledInterval(
       updated.date,
       this.stretchPreviewStartMinutes,
@@ -1767,7 +1592,15 @@ export struct CalendarTab {
       });
       return;
     }
-    scheduleStore.updateEvent(updated);
+    try {
+      await scheduleStore.updateEvent(updated);
+    } catch (_error) {
+      this.stretchOriginalEvent = null;
+      this.stretchEventId = '';
+      this.loadData();
+      promptAction.showToast({ message: '日程保存失败，原安排已保留' });
+      return;
+    }
     this.stretchOriginalEvent = null;
     this.stretchEventId = '';
     this.loadData();
@@ -2127,6 +1960,12 @@ export struct CalendarTab {
         .backgroundColor(this.viewMode === 'day' ? '#007AFF' : '#00000000')
         .borderRadius(4)
         .onClick(() => { this.switchToView('day'); })
+
+      Text('诊断')
+        .fontSize(12)
+        .fontColor('#666666')
+        .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+        .onClick(() => { this.copyDiagnosticInfo(); })
     }
     .borderRadius(6)
     .backgroundColor('#F0F0F0')
@@ -2163,12 +2002,16 @@ export struct CalendarTab {
     this.contextMenuEventId = evt.id;
   }
 
-  /** 点击聚焦事件之外的时间轴时退出聚焦，不改动持久化数据。 */
-  private cancelEventFocus(): void {
-    this.contextMenuEventId = '';
-    this.stretchEventId = '';
-    this.stretchOriginalEvent = null;
-    this.stretchPreviewSteps = [];
+  private copyDiagnosticInfo(): void {
+    try {
+      const report: string = buildDiagnosticReport('CalendarTab', this.viewMode);
+      pasteboard.getSystemPasteboard().setDataSync(
+        pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, report)
+      );
+      promptAction.showToast({ message: '诊断信息已复制；报告不含任务名称或步骤内容' });
+    } catch (_error) {
+      promptAction.showToast({ message: '复制诊断信息失败' });
+    }
   }
 
   /** 周视图合并卡内的一行；每个任务仍可独立点击或长按。 */
@@ -2301,7 +2144,7 @@ export struct CalendarTab {
           .onActionUpdate((event: GestureEvent) => {
             this.updateEventStretch('top', event, hourHeight);
           })
-          .onActionEnd(() => { this.finishEventStretch(); })
+          .onActionEnd(() => { void this.finishEventStretch(); })
           .onActionCancel(() => { this.cancelEventStretch(); })
       )
 
@@ -2325,7 +2168,7 @@ export struct CalendarTab {
           .onActionUpdate((event: GestureEvent) => {
             this.updateEventStretch('bottom', event, hourHeight);
           })
-          .onActionEnd(() => { this.finishEventStretch(); })
+          .onActionEnd(() => { void this.finishEventStretch(); })
           .onActionCancel(() => { this.cancelEventStretch(); })
       )
     }
@@ -3015,11 +2858,7 @@ export struct CalendarTab {
                 .backgroundColor(day.isToday ? '#F0F7FF' : '#FFFFFF')
                 .onClick((event: ClickEvent) => {
                   if (this.transferMode !== '') {
-                    this.handleTransferTargetClick(
-                      day.dateStr, event.y, this.weekHourHeight, WEEK_START_HOUR
-                    );
-                  } else if (this.stretchEventId !== '') {
-                    this.cancelEventFocus();
+                    this.handleTransferTargetClick(day.dateStr, event.y, this.weekHourHeight, WEEK_START_HOUR);
                   } else {
                     this.goToDayView(day.dateStr);
                   }
@@ -3337,11 +3176,7 @@ export struct CalendarTab {
             .backgroundColor('#FFFFFF')
             .onClick((event: ClickEvent) => {
               if (this.transferMode !== '') {
-                this.handleTransferTargetClick(
-                  this.selectedDateStr, event.y, this.dayHourHeight, 0
-                );
-              } else if (this.stretchEventId !== '') {
-                this.cancelEventFocus();
+                this.handleTransferTargetClick(this.selectedDateStr, event.y, this.dayHourHeight, 0);
               }
             })
             // ---- 日视图拖拽目标 ----
@@ -3419,7 +3254,7 @@ export struct CalendarTab {
     // 加上 GRID_LINE_OFFSET：分割线相对槽位顶部下移了该值，事件块上边界需与分割线对齐
     const startMinutes: number = this.stretchEventId === evt.id ?
       this.stretchPreviewStartMinutes : evt.startHour * 60 + evt.startMinute;
-    return timelineMinutesToY(startMinutes, hourHeight, startHour * 60, GRID_LINE_OFFSET);
+    return getEventBlockTop(startMinutes, hourHeight, startHour, GRID_LINE_OFFSET);
   }
 
   /**
@@ -3429,7 +3264,7 @@ export struct CalendarTab {
   private eventBlockHeight(evt: ScheduledEvent, hourHeight: number, minHeight: number): number {
     const duration: number = this.stretchEventId === evt.id ?
       this.stretchPreviewDuration : getTotalDuration(evt.steps);
-    return Math.max(durationMinutesToHeight(duration, hourHeight), minHeight);
+    return getEventBlockHeight(duration, hourHeight, minHeight);
   }
 
   /** 根据事件块的缩放后高度，逐步放宽步骤摘要可显示行数。 */
@@ -3527,12 +3362,7 @@ export struct CalendarTab {
    * @returns 该日期所在周的周一 00:00:00
    */
   static getMondayOf(date: Date): Date {
-    const d: Date = new Date(date);
-    const day: number = d.getDay(); // 0=周日, 1=周一, ..., 6=周六
-    // 计算到周一的偏移量
-    const diff: number = day === 0 ? -6 : 1 - day;
-    d.setDate(d.getDate() + diff);
-    d.setHours(0, 0, 0, 0);
-    return d;
+    return getMondayOfUtil(date);
   }
 }
+
